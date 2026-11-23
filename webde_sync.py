@@ -20,7 +20,9 @@ Usage:
     webde_sync.py --list | --example-config
 
 Arguments after `--` are passed to `rclone bisync` / `rclone check` unchanged
-(e.g. `-- --tpslimit 4`).  Requires Python >= 3.11 and rclone >= 1.66.
+(e.g. `-- --tpslimit 4`), except for the flags this wrapper controls itself
+(--force, --resync, --dry-run, ...), which are refused.  Requires Python >= 3.11
+and rclone >= 1.66.
 See README.md for setup.
 """
 
@@ -155,7 +157,7 @@ def load_config(path: Path) -> dict[str, dict]:
         return {}
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as e:
+    except (OSError, ValueError) as e:      # incl. TOML syntax and non-UTF-8 bytes
         raise UsageError(f"cannot read config {tilde(path)}: {e}") from None
     for name, section in data.items():
         if not isinstance(section, dict):
@@ -177,6 +179,14 @@ def normalize_remote(remote: str) -> str:
     return remote if stripped.endswith(":") or not stripped else stripped
 
 
+def expand_path(value: str, key: str, where: str) -> Path:
+    try:
+        return Path(value).expanduser()
+    except RuntimeError:                    # ~user of a user that does not exist
+        raise UsageError(f"{where}: {key} = {value!r}: cannot resolve the home "
+                         "directory in this path") from None
+
+
 def profile_from_dict(name: str | None, raw: dict, where: str) -> Profile:
     for key, value in raw.items():
         if key not in PROFILE_KEYS:
@@ -189,11 +199,11 @@ def profile_from_dict(name: str | None, raw: dict, where: str) -> Profile:
     for key in ("local", "remote"):
         if not raw.get(key):
             raise UsageError(f"{where}: '{key}' is required")
-    p = Profile(name=name, local=Path(raw["local"]).expanduser(),
+    p = Profile(name=name, local=expand_path(raw["local"], "local", where),
                 remote=normalize_remote(raw["remote"]))
     p.filters = list(raw.get("filters", []))
     if raw.get("filters_file"):
-        p.filters_file = Path(raw["filters_file"]).expanduser()
+        p.filters_file = expand_path(raw["filters_file"], "filters_file", where)
     p.max_delete = raw.get("max_delete", p.max_delete)
     if not 0 <= p.max_delete <= 100:
         raise UsageError(f"{where}: max_delete is a percentage (0-100)")
@@ -253,42 +263,95 @@ BISYNC_BOOL_FLAGS = {"--check-access", "--create-empty-src-dirs", "--download-ha
                      "--resync", "-1", "--slow-hash-sync-only"}
 
 
-def general_flags(flags: list[str]) -> list[str]:
-    """Drop bisync-only flags (and their values) from a user flag list."""
-    out, skip_value = [], False
+# rclone filter flags (the whole "Filter" group of `rclone help flags`; a test
+# compares these sets with the rclone binaries): users may put them in
+# rclone_flags / after `--` (bisync combines them with the --filters-file
+# rules), but helper calls must not see them -- `purge` rejects filters
+# outright, and they could hide entries from the lsf calls that check backups
+# and emptiness.
+FILTER_VALUE_FLAGS = {"--exclude", "--exclude-from", "--exclude-if-present", "--files-from",
+                      "--files-from-raw", "--files-from0", "--filter", "-f", "--filter-from",
+                      "--hash-filter", "--include", "--include-from", "--max-age",
+                      "--max-depth", "--max-size", "--metadata-exclude",
+                      "--metadata-exclude-from", "--metadata-filter", "--metadata-filter-from",
+                      "--metadata-include", "--metadata-include-from", "--min-age", "--min-size"}
+FILTER_BOOL_FLAGS = {"--delete-excluded", "--ignore-case"}
+VALUE_FLAGS = BISYNC_VALUE_FLAGS | FILTER_VALUE_FLAGS      # the next argument is their value
+
+# Flags this wrapper sets itself.  Passed through (rclone_flags / after `--`)
+# they would come last on the rclone command line and silently override it:
+# --force without a preview, a "sync" that is really a dry-run or a resync,
+# state/backup/log locations the wrapper does not know about.
+_FIXED = "it is set by webde_sync.py"
+OWNED_FLAGS = {
+    "--force": "use `webde_sync.py --force`, which shows a preview first",
+    "--resync": "use `webde_sync.py --resync`", "-1": "use `webde_sync.py --resync`",
+    "--resync-mode": "set `resync_mode` in the profile",
+    "--dry-run": "use `webde_sync.py -n`", "-n": "use `webde_sync.py -n`",
+    "--interactive": "webde_sync.py asks for confirmation itself",
+    "-i": "webde_sync.py asks for confirmation itself",
+    "--filters-file": "use `filters` / `filters_file` in the profile",
+    "--backup-dir1": "backups are controlled by `backups` in the profile",
+    "--backup-dir2": "backups are controlled by `backups` in the profile",
+    "--workdir": _FIXED, "--log-file": _FIXED, "--use-json-log": _FIXED,
+}
+RE_SHORT_FLAGS = re.compile(r"[A-Za-z1]*")       # rclone's one-letter flags, e.g. -v -n -1
+
+
+def split_short_flags(flags: list[str]) -> list[str]:
+    """Spell out combined one-letter flags the way rclone reads them (-vn ->
+    -v -n, -fRULE -> -f RULE), so the checks below see every flag.  Only used
+    for those checks and the helper calls; bisync gets the user's own spelling."""
+    out, is_value = [], False
     for f in flags:
-        if skip_value:
-            skip_value = False
+        if is_value or f.startswith("--") or len(f) <= 2 or f[0] != "-" or f[2] == "=":
+            out.append(f)
+            is_value = not is_value and f in VALUE_FLAGS
             continue
-        name = f.split("=", 1)[0]
-        if name in BISYNC_VALUE_FLAGS:
-            skip_value = "=" not in f
-        elif name not in BISYNC_BOOL_FLAGS:
+        head, has_f, rule = f[1:].partition("f")        # -f is the only one with a value
+        if RE_SHORT_FLAGS.fullmatch(head) and (has_f or not head.isdigit()):
+            out += [f"-{c}" for c in head] + (["-f"] if has_f else []) + ([rule] if rule else [])
+            is_value = bool(has_f) and not rule
+        else:                                           # e.g. a stray value like -5d
             out.append(f)
     return out
 
 
-# rclone filter flags: users may put them in rclone_flags / after `--` (bisync
-# combines them with the --filters-file rules), but helper calls must not see
-# them -- `purge` rejects filters outright, and they could hide entries from
-# the lsf calls that check backups and emptiness.
-FILTER_VALUE_FLAGS = {"--exclude", "--exclude-from", "--filter", "--filter-from",
-                      "--files-from", "--files-from-raw", "--include", "--include-from",
-                      "--min-size", "--max-size", "--min-age", "--max-age"}
+def check_user_flags(flags: list[str]) -> None:
+    """Refuse user-supplied rclone flags that this wrapper controls itself."""
+    is_value = False
+    for f in flags:
+        if is_value:
+            is_value = False
+            continue
+        name = f.split("=", 1)[0]
+        if name in OWNED_FLAGS:
+            hint = (f" (if {name} is the value of the flag before it, write that as "
+                    "--flag=VALUE)") if len(name) == 2 else ""
+            raise UsageError(f"rclone flag {name} is not accepted in rclone_flags or after "
+                             f"`--`: {OWNED_FLAGS[name]}{hint}")
+        is_value = f in VALUE_FLAGS
+
+
+def _drop_flags(flags: list[str], value_flags: set[str], bool_flags: set[str]) -> list[str]:
+    out, i = [], 0
+    while i < len(flags):
+        name = flags[i].split("=", 1)[0]
+        n = 2 if flags[i] in VALUE_FLAGS else 1     # the flag and, if separate, its value
+        if name not in value_flags and name not in bool_flags:
+            out += flags[i:i + n]
+        i += n
+    return out
+
+
+def general_flags(flags: list[str]) -> list[str]:
+    """Drop bisync-only flags (and their values) from a user flag list."""
+    return _drop_flags(flags, BISYNC_VALUE_FLAGS, BISYNC_BOOL_FLAGS)
 
 
 def strip_filter_flags(flags: list[str]) -> list[str]:
     """Drop rclone filter flags (and their values) from a user flag list."""
-    out, skip_value = [], False
-    for f in flags:
-        if skip_value:
-            skip_value = False
-            continue
-        if f.split("=", 1)[0] in FILTER_VALUE_FLAGS:
-            skip_value = "=" not in f
-        else:
-            out.append(f)
-    return out
+    return _drop_flags(flags, FILTER_VALUE_FLAGS, FILTER_BOOL_FLAGS)
 
 
 def find_rclone(explicit: str | None) -> Rclone:
@@ -489,7 +552,7 @@ def render_filters(profile: Profile, st: State) -> str:
     if profile.filters_file:
         try:
             lines += profile.filters_file.read_text(encoding="utf-8").splitlines()
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             raise UsageError(f"cannot read filters_file: {e}") from None
     return "\n".join(lines) + "\n"
 
@@ -604,8 +667,9 @@ RE_QCOPY = re.compile(r"^- (Path[12])\s+Queue copy to (Path[12])\s+- (.+)$")
 RE_QDEL = re.compile(r"^- (Path[12])\s+Queue delete\s+- (.+)$")
 RE_BOTH = re.compile(r"^- WARNING\s+New or changed in both paths\s+- (.+)$")
 RE_RESYNC_DIR = re.compile(r"^- (Path[12])\s+Resync is copying files to\s+- (Path[12])")
-RE_COPIED = re.compile(r"^(.+): Copied \((?:new|replaced existing)\)")
-RE_SYMLINK = re.compile(r"^(.+): Can't follow symlink")
+RE_COPIED = re.compile(r"^Copied \((?:new|replaced existing)\)")
+RE_LOCKED = re.compile(r"^(?:\d{4}/\d\d/\d\d \d\d:\d\d:\d\d )?Failed to bisync"
+                       r"(?: with \d+ errors: last error was)?: prior lock file found")
 RE_CONFLICT_COPY = re.compile(r"^(.+)\.conflict\d+$")
 RE_FAILED = re.compile(r"^.+?: Failed to [a-z ]+: (.+)$")
 RE_SUMMARY = re.compile(r"^Path[12]:\s+(\d+) changes:")
@@ -650,13 +714,13 @@ class Report:
 def unquote(path: str) -> str:
     """bisync prints names containing quotes or backslashes Go-quoted ("a\\"b")."""
     if len(path) >= 2 and path[0] == path[-1] == '"':
-        try:
-            return json.loads(path)
-        except ValueError:
+        for parse in (json.loads, ast.literal_eval):
             try:
-                return ast.literal_eval(path)
+                value = parse(path)
             except (ValueError, SyntaxError):
-                pass
+                continue
+            if isinstance(value, str):      # '"a","b"' is a tuple, not a quoted name
+                return value
     return path
 
 
@@ -682,6 +746,7 @@ class Msg:
     obj: str = ""
     size: int | None = None       # exact bytes (msg itself shows e.g. "48.828Ki")
     skipped: str = ""             # dry-run action: copy, move (= backup), ...
+    msg: str = ""                 # rclone's own wording, without the object name
 
 
 def log_messages(lines) -> list[Msg]:
@@ -696,9 +761,10 @@ def log_messages(lines) -> list[Msg]:
             msg, obj = ANSI.sub("", str(o.get("msg", ""))), str(o.get("object") or "")
             size = o.get("size")
             out.append(Msg(str(o.get("level", "")), f"{obj}: {msg}" if obj else msg, obj,
-                           size if isinstance(size, int) else None, str(o.get("skipped") or "")))
+                           size if isinstance(size, int) else None, str(o.get("skipped") or ""),
+                           msg))
         except (ValueError, AttributeError):
-            out.append(Msg("raw", ANSI.sub("", line)))
+            out.append(Msg("raw", ANSI.sub("", line), msg=ANSI.sub("", line)))
     return out
 
 
@@ -709,7 +775,14 @@ def parse_report(messages: list[Msg], local: Path, remote: str) -> Report:
     copies: list[tuple[str, str]] = []          # (target side, rel path)
     resync_target = None
     for entry in messages:
-        level, msg, text = entry.level, entry.text, entry.text.strip()
+        level, text = entry.level, entry.text.strip()
+        # Files can be *named* like bisync's messages ("Failed to bisync.txt", "- Path2
+        # Queue delete - x"), and names show up as the object and at the end of plan
+        # lines.  So match rclone's own wording only, anchored at its start: `own` is
+        # the message without the object name, `plain` a message that has no object
+        # at all -- which is how bisync logs its plan and status lines.
+        own = entry.msg.strip()
+        plain = "" if entry.obj else own
         if entry.skipped and entry.obj:               # dry-run, structured fields
             if entry.skipped == "copy":
                 if entry.size is not None:
@@ -718,52 +791,57 @@ def parse_report(messages: list[Msg], local: Path, remote: str) -> Report:
                     copies.append((resync_target, entry.obj))
             elif entry.skipped == "move":             # old version moved to the backup
                 rep.replaced.add(entry.obj)
-        elif m := RE_DETECT.match(text):
+        elif m := RE_DETECT.match(plain):
             kind = m[2]
             detect[(m[1], unquote(m[3]))] = ("new" if kind == "File is new" else
                                     "deleted" if kind == "File was deleted" else
                                     kind.replace("File ", "", 1))
-        elif m := RE_QCOPY.match(text):
+        elif m := RE_QCOPY.match(plain):
             copies.append((m[2], rel(m[2], m[3])))
-        elif m := RE_QDEL.match(text):
+        elif m := RE_QDEL.match(plain):
             (rep.delete_remote if m[1] == "Path2" else rep.delete_local).append(rel(m[1], m[2]))
-        elif m := RE_BOTH.match(text):
+        elif m := RE_BOTH.match(plain):
             both.add(unquote(m[1]))
-        elif m := RE_RESYNC_DIR.match(text):
+        elif m := RE_RESYNC_DIR.match(plain):
             resync_target = m[2]
-        elif (m := RE_COPIED.match(text)) and resync_target:
-            copies.append((resync_target, m[1]))
-        elif (m := RE_SYMLINK.match(text)) and rel("Path1", m[1]) not in rep.symlinks:
-            rep.symlinks.append(rel("Path1", m[1]))
-        if m := RE_SUMMARY.match(text):
+        elif entry.obj and resync_target and RE_COPIED.match(own):
+            copies.append((resync_target, entry.obj))
+        elif entry.obj and own.startswith("Can't follow symlink") \
+                and entry.obj not in rep.symlinks:
+            rep.symlinks.append(entry.obj)
+        if m := RE_SUMMARY.match(plain):
             rep.bisync_changes += int(m[1])
-        if text.startswith("- ") and "Do queued copies" not in text:
-            rep.plan_lines.append(text)
-        if text == "No changes found":
+        if plain.startswith("- ") and "Do queued copies" not in plain:
+            rep.plan_lines.append(plain)
+        if plain == "No changes found":
             rep.no_changes = True
-        if "Bisync successful" in text:
+        if plain == "Bisync successful":
             rep.success = True
-        if "Must run --resync" in text:
+        if plain.startswith("Bisync aborted. Must run --resync"):
             rep.needs_resync = True
-        if "prior lock file found" in text or "lock file found" in text.lower():
+        if RE_LOCKED.match(plain):
             rep.lock_error = True
-        if "Safety abort" in text:
+        # logged as object "Safety abort" + "too many deletes ...", or as one message
+        if plain.startswith("Safety abort: ") or (entry.obj == "Safety abort"
+                                                  and own.startswith("too many deletes")):
             rep.safety_abort = True
-        if "Empty current Path" in text:
+        if plain.startswith("Empty current Path"):
             rep.empty_side = True
-        if "Empty prior Path" in text:
+        if plain.startswith("Empty prior Path"):
             rep.empty_baseline = True
-        if "Transferred:" in msg and "Elapsed time" in msg:
-            rep.stats = msg.strip("\n")
+        if "Transferred:" in plain and "Elapsed time" in plain:
+            rep.stats = entry.msg.strip("\n")
             if m := RE_STATS_COUNT.search(rep.stats):
                 rep.stats_transfers = int(m[1])
-        if level in ("error", "critical", "raw") or text.startswith("Failed to bisync"):
+        if level in ("error", "critical", "raw") or plain.startswith("Failed to bisync"):
             if text not in rep.errors:            # rclone repeats them per retry
                 rep.errors.append(text)
             if entry.obj and (m := RE_FAILED.match(text)):
                 rep.failed.setdefault(entry.obj, m[1].rsplit(": ", 1)[-1])
-        elif level in ("warning", "notice") and "WARNING" in text and not RE_BOTH.match(text) \
-                and not any(w in text for w in IGNORED_WARNINGS):
+        elif level in ("warning", "notice") and not RE_BOTH.match(plain) \
+                and not any(w in own for w in IGNORED_WARNINGS) \
+                and (plain.startswith("- WARNING") if plain.startswith("- ")
+                     else "WARNING" in own):
             rep.warnings.append(text)
     copies = list(dict.fromkeys(copies))           # dedupe, keep order
     for target, path in copies:
@@ -842,16 +920,8 @@ def pending_conflicts(profile: Profile, st: State) -> list[str]:
         for line in lines:
             if ".conflict" not in line or '"' not in line:
                 continue
-            quoted = line[line.index('"'):]            # last field: Go-quoted path
-            try:
-                path = json.loads(quoted)
-            except ValueError:
-                try:
-                    path = ast.literal_eval(quoted)
-                except (ValueError, SyntaxError):
-                    continue
-            if isinstance(path, str) and RE_CONFLICT_COPY.match(path) \
-                    and (profile.local / path).exists():
+            path = unquote(line[line.index('"'):])     # last field: Go-quoted path
+            if RE_CONFLICT_COPY.match(path) and (profile.local / path).exists():
                 found.add(path)
     return sorted(found)
 
@@ -1094,7 +1164,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         prog="webde_sync.py", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Safe two-way sync of a local folder with an rclone remote "
                     "(e.g. web.de) via `rclone bisync`, with preview and confirmation.",
-        epilog="Arguments after `--` go to rclone unchanged, e.g. `-- --tpslimit 4`.\n"
+        epilog="Arguments after `--` go to rclone unchanged, e.g. `-- --tpslimit 4` (flags "
+               "this\nwrapper controls itself, like --force or --dry-run, are refused "
+               "there).\n"
                "Exit codes: 0 ok, 1 sync failed / differences, 2 usage error, "
                "3 aborted by the user.")
     ap.add_argument("target", nargs="*", metavar="PROFILE | LOCAL_DIR REMOTE")
@@ -1152,6 +1224,8 @@ def run(args: argparse.Namespace, extra: list[str]) -> int:
     if args.force and args.yes:
         raise UsageError("--force needs a reviewed preview; it cannot be combined with --yes")
     profile = resolve_profile(args, config_path)
+    user_flags = split_short_flags(profile.rclone_flags + extra)
+    check_user_flags(user_flags)
     max_show = None if args.list_all else args.max_show
 
     profile.local = profile.local.resolve()
@@ -1160,7 +1234,7 @@ def run(args: argparse.Namespace, extra: list[str]) -> int:
     if profile.local == Path("/"):
         raise UsageError("refusing to sync the whole file system")
     rc = find_rclone(args.rclone)
-    rc.flags = general_flags(profile.rclone_flags + extra)   # e.g. --config, --timeout
+    rc.flags = general_flags(user_flags)                     # e.g. --config, --timeout
     ensure_config_password(rc)
     check_remote_configured(rc, profile.remote)
     warn_plain_http(rc, profile.remote)
@@ -1381,7 +1455,7 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USAGE
-    except SyncError as e:
+    except (SyncError, OSError) as e:       # OSError: unwritable state dir, full disk, ...
         print(f"error: {e}", file=sys.stderr)
         return EXIT_FAIL
     except KeyboardInterrupt:

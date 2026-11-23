@@ -14,6 +14,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -148,6 +149,112 @@ def test_strip_filter_flags_drops_filters_keeps_the_rest():
     flags = ["--exclude", "*.log", "--max-age=2y", "--include-from", "/f", "--min-size",
              "10k", "--tpslimit", "4", "--config", "/x.conf", "-v"]
     assert ws.strip_filter_flags(flags) == ["--tpslimit", "4", "--config", "/x.conf", "-v"]
+    flags = ["-f", "- *.log", "--exclude-if-present", ".nosync", "--ignore-case", "-f=+ a",
+             "--metadata-exclude", "a=b", "--hash-filter=1/2", "--files-from0", "/f",
+             "--delete-excluded", "--bwlimit", "2M"]
+    assert ws.strip_filter_flags(flags) == ["--bwlimit", "2M"]
+
+
+def test_flag_values_are_not_taken_for_flags():
+    flags = ["--max-depth", "-1", "--tpslimit", "4", "--filter", "--resilient", "-P"]
+    assert ws.general_flags(flags) == flags          # -1 and --resilient are values here
+    assert ws.strip_filter_flags(ws.general_flags(flags)) == ["--tpslimit", "4", "-P"]
+    ws.check_user_flags(ws.split_short_flags(flags))  # ... and -1 is not --resync
+
+
+@pytest.mark.parametrize("flags, expected", [
+    (["-vn"], ["-v", "-n"]), (["-1v", "-P"], ["-1", "-v", "-P"]),
+    (["-f- *.log", "-vv"], ["-f", "- *.log", "-v", "-v"]),
+    (["-vf", "-n"], ["-v", "-f", "-n"]),             # -n is the filter rule here
+    (["-vf- *.LOG", "-11", "- *.pdf"], ["-v", "-f", "- *.LOG", "-11", "- *.pdf"]),
+    (["-f=- x", "--exclude", "-vn", "-5d"], ["-f=- x", "--exclude", "-vn", "-5d"]),
+    (["--bwlimit", "2M", "--dry-run=true"], ["--bwlimit", "2M", "--dry-run=true"]),
+])
+def test_split_short_flags(flags, expected):
+    assert ws.split_short_flags(flags) == expected
+
+
+@pytest.mark.parametrize("flags", [
+    ["--force"], ["--tpslimit", "4", "--force"], ["--resync"], ["-1"], ["--resync-mode", "path2"],
+    ["--resync-mode=path2"], ["--dry-run"], ["--dry-run=true"], ["-n"], ["-vn"], ["-i"],
+    ["--workdir", "/x"], ["--filters-file=/x"], ["--backup-dir1", "/x"], ["--backup-dir2=r:x"],
+    ["--log-file", "/x"], ["--use-json-log=false"], ["-f", "- *.log", "-n"],
+])
+def test_wrapper_owned_flags_are_refused(flags):
+    with pytest.raises(ws.UsageError, match="is not accepted in rclone_flags"):
+        ws.check_user_flags(ws.split_short_flags(flags))
+
+
+@pytest.mark.parametrize("flags", [
+    ["--tpslimit", "4", "--bwlimit", "2M"], ["--filter", "--force"], ["-f", "-n"], ["-vf", "-n"],
+    ["--exclude=-n"], ["--max-depth", "-1"], ["--max-delete", "10"], ["-vv", "-P"],
+])
+def test_other_flags_and_flag_values_are_accepted(flags):
+    ws.check_user_flags(ws.split_short_flags(flags))
+
+
+def test_unquote_returns_names_only():
+    assert ws.unquote('"quo\\"te"') == 'quo"te'
+    assert ws.unquote('"tag\\U000e0041"') == "tag\U000e0041"   # Go escape unknown to JSON
+    assert ws.unquote('"a","b"') == '"a","b"'                   # a name, not a tuple
+    assert ws.unquote('"12"') == "12" and ws.unquote("plain.txt") == "plain.txt"
+
+
+def test_file_names_that_look_like_bisync_messages_change_nothing():
+    rep = parse([
+        jl("- Path2    File is new               - Must run --resync.txt"),
+        jl("- Path2    File is new               - WARNING Safety abort: Bisync successful"),
+        jl("- Path2    Queue copy to Path1       - /data/local/Must run --resync.txt"),
+        skipped("copy", "Failed to bisync.txt", 2),
+        skipped("copy", "WARNING.txt", 2),
+        jl("Copied (new)", "info", obj="Bisync successful"),
+        jl("Copied (new)", "info", obj="Safety abort"),
+        jl("Copied (new)", "info", obj="Safety abort: all files were changed.txt"),
+        jl("Copied (new)", "info", obj="- Path2    Queue delete    - victim.txt"),
+        jl("Copied (new)", "info", obj="Empty prior Path1 listing"),
+        jl("Copied (new)", "info", obj="Failed to bisync: prior lock file found"),
+        jl("Copied (new)", "info", obj="Path1:    7 changes"),
+        jl("Can't follow symlink without -L/--copy-links", "notice", obj='"a","b"'),
+    ])
+    assert not (rep.success or rep.needs_resync or rep.safety_abort or rep.lock_error
+                or rep.empty_baseline or rep.errors or rep.warnings or rep.bisync_changes)
+    assert rep.delete_remote == [] and rep.delete_local == []
+    assert rep.download == {"Must run --resync.txt": "new"}
+    assert rep.symlinks == ['"a","b"']
+
+
+def test_real_status_messages_are_recognised():
+    """The wording and object fields as rclone v1.66 and v1.76 log them."""
+    assert parse([jl('too many deletes (>50%, 5 of 6) on Path1 "/l/". Run with --force if '
+                     'desired.', "error", obj="Safety abort")]).safety_abort
+    assert parse([jl('Safety abort: all files were changed on Path1 "/l/". Run with --force '
+                     'if desired.', "error")]).safety_abort
+    for line in ("2026/11/23 23:51:52 Failed to bisync: prior lock file found: /s/a..b.lck",
+                 jl("Failed to bisync: prior lock file found: /s/a..b.lck")):
+        rep = parse([line])
+        assert rep.lock_error and rep.errors
+    assert parse([jl("Empty current Path1 listing. Cannot sync to an empty directory: /s/x",
+                     "error")]).empty_side
+    assert parse([jl("Empty prior Path1 listing. Cannot sync to an empty directory: /s/x",
+                     "error")]).empty_baseline
+    assert parse([jl("Bisync aborted. Must run --resync to recover.", "error")]).needs_resync
+    assert parse([jl("Failed to bisync: too many deletes")]).errors
+    assert parse([jl("WARNING: something new", "notice")]).warnings
+    assert parse([jl("- WARNING  Something else             - x.txt")]).warnings
+
+
+def test_config_and_path_errors_are_usage_errors(tmp_path):
+    conf = tmp_path / "profiles.toml"
+    conf.write_bytes(b'[p]\nlocal = "/x"\nremote = "r:"\n# caf\xe9\n')    # not UTF-8
+    with pytest.raises(ws.UsageError, match="cannot read config"):
+        ws.load_config(conf)
+    with pytest.raises(ws.UsageError, match="home directory"):
+        ws.profile_from_dict("p", {"local": "~no_such_user_xyz/d", "remote": "r:"}, "t")
+    rules = tmp_path / "rules"
+    rules.write_bytes(b"- caf\xe9*\n")
+    p = ws.Profile(name="p", local=tmp_path, remote="r:", filters_file=rules)
+    with pytest.raises(ws.UsageError, match="filters_file"):
+        ws.render_filters(p, ws.State(tmp_path / "st"))
 
 
 def test_clear_stale_listings_drops_listings_but_not_locks(tmp_path):
@@ -532,14 +639,19 @@ def test_profile_mode_filters_and_resync_on_filter_change(env):
     assert r.returncode == 0 and "RESYNC" in r.stdout and env.remote("junk.tmp").exists()
 
 
-def test_backup_pruning_survives_filter_flags_after_double_dash(env):
+@pytest.mark.parametrize("flags", [
+    ("--exclude", "*.log"), ("-f", "- *.log"), ("--exclude-if-present", ".nosync"),
+    ("--ignore-case", "-vf- *.LOG"),
+], ids=lambda f: f[0])
+def test_backup_pruning_survives_filter_flags_after_double_dash(env, flags):
     env.baseline()
     old = (datetime.now().astimezone() - timedelta(days=40)).strftime(ws.STAMP_FMT)
     for side in (env.local, env.server / "sync"):
         env.put(side, f"{ws.BACKUP_DIR}/{old}/x.txt", "old\n")
     env.put(env.local, "keep0.txt", "changed\n")
-    r = env.sync("--", "--exclude", "*.log")     # for bisync; must not reach purge/lsf
+    r = env.sync("--", *flags)                   # for bisync; must not reach purge/lsf
     assert r.returncode == 0, r.stdout + r.stderr
+    assert "warning" not in r.stderr, r.stderr
     assert "Backups of" in r.stdout               # the backup listing is not filtered away
     for side in (env.local, env.server / "sync"):
         assert not (side / ws.BACKUP_DIR / old).exists()
@@ -857,3 +969,83 @@ def test_local_empty_first_run_downloads_everything(env):
     r = env.sync()
     assert r.returncode == 0 and "download to local:" in r.stdout, r.stdout + r.stderr
     assert (env.local / "d" / "b.txt").read_text() == "b\n"
+
+
+def filter_group_flags(rclone: str) -> dict[str, bool]:
+    """The flags in the "Filter" group of `rclone help flags`: name -> takes a value."""
+    out = subprocess.run([rclone, "--config", os.devnull, "help", "flags"], check=True,
+                         capture_output=True, text=True).stdout
+    flags: dict[str, bool] = {}
+    for line in out.split("Flags for filtering directory listings", 1)[1].splitlines()[1:]:
+        m = re.match(r"\s+(?:(-\w), )?(--[\w-]+)( \S+)?  ", line)
+        if m:
+            flags.update({name: bool(m[3]) for name in m.group(1, 2) if name})
+        elif flags:
+            break                                  # end of the group
+    return flags
+
+
+@pytest.mark.parametrize("rclone", RCLONES or [None],
+                         ids=lambda p: Path(p).name if p else "no-rclone")
+def test_filter_flag_sets_cover_rclones_filter_group(rclone):
+    if rclone is None:
+        pytest.skip("set WEBDE_SYNC_TEST_RCLONE (or use `make test`)")
+    flags = filter_group_flags(rclone)
+    assert len(flags) > 15 and flags["--filter"] and flags["-f"] and not flags["--ignore-case"]
+    with_value = {name for name, takes_value in flags.items() if takes_value}
+    assert with_value <= ws.FILTER_VALUE_FLAGS, with_value - ws.FILTER_VALUE_FLAGS
+    assert set(flags) - with_value <= ws.FILTER_BOOL_FLAGS
+    assert not with_value & ws.FILTER_BOOL_FLAGS
+
+
+def test_wrapper_owned_flags_cannot_be_passed_through(env):
+    write_profile(env, "forced", rclone_flags=["--tpslimit", "50", "--force"])
+    env.baseline(6)
+    for p in sorted(env.local.glob("keep*.txt"))[1:]:
+        p.unlink()                                     # 5 of 6 files gone
+    for r in (env.sync("-y", "--", "--force"), env.run("forced", "-y"),
+              env.sync("-y", "--", "--resync-mode", "path2"), env.sync("-y", "--", "-1")):
+        assert r.returncode == ws.EXIT_USAGE and "is not accepted" in r.stderr, r.stderr
+    assert len(list(env.remote("").glob("keep*.txt"))) == 6
+    assert env.sync("-y").returncode == 1              # the safety abort still stands
+    for flags in (["--dry-run"], ["-vn"]):             # would report "Done" for a no-op
+        r = env.sync("--", *flags)
+        assert r.returncode == ws.EXIT_USAGE and "webde_sync.py -n" in r.stderr, r.stderr
+        assert "Done" not in r.stdout
+
+
+def test_file_names_that_look_like_rclone_messages_sync_normally(env):
+    env.baseline()
+    names = ["Failed to bisync.txt", "Must run --resync.txt", "Bisync successful.txt",
+             "WARNING.txt", "Safety abort", "- Path2    Queue delete    - victim.txt"]
+    for n in names:
+        env.put(env.server, "sync/" + n, "x\n")
+    (env.local / '"a","b"').symlink_to("/nonexistent")  # used to crash the log parser
+    r = env.sync()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Apply these 6 change(s)" in r.stdout and "delete on server" not in r.stdout
+    assert "skipped symlinks:          1" in r.stdout
+    assert r.stderr == ""
+    for n in names:
+        assert (env.local / n).read_text() == "x\n", n
+    for n in names:
+        env.put(env.local, n, "changed\n")             # real run without a preview
+    r = env.sync("-y")
+    assert r.returncode == 0 and r.stderr == "", r.stdout + r.stderr
+    assert "deleted" not in r.stdout.split("Backups of")[0]
+    assert env.remote("Failed to bisync.txt").read_text() == "changed\n"
+    assert "Everything is in sync." in env.sync().stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write everywhere")
+def test_unwritable_state_dir_is_an_error_not_a_traceback(env):
+    ro = env.tmp / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    env.env["XDG_STATE_HOME"] = str(ro)
+    try:
+        r = env.sync("-n")
+    finally:
+        ro.chmod(0o700)
+    assert r.returncode == ws.EXIT_FAIL and r.stderr.startswith("error: ")
+    assert "Traceback" not in r.stderr and "Permission denied" in r.stderr

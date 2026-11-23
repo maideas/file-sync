@@ -88,7 +88,7 @@ filters = ["- .git/**", "- *.tmp"]
 | `sync_empty_dirs` | `false` | also create and delete empty directories |
 | `conflict_resolve` | `none` | `none` keeps both copies; or `local`, `remote`, `larger`, `smaller`, ... |
 | `resync_mode` | `local` | which copy wins for differing files during `--resync` |
-| `rclone_flags` | `[]` | extra rclone flags, e.g. `["--tpslimit", "4"]`: bisync-only flags reach only bisync, and filter flags (`--exclude`, `--min-size`, ...) are kept away from the backup housekeeping calls (pruning, listings, emptiness check) so those always work |
+| `rclone_flags` | `[]` | extra rclone flags, e.g. `["--tpslimit", "4"]`: bisync-only flags reach only bisync, and filter flags (`--exclude`, `--min-size`, ...) are kept away from the backup housekeeping calls (pruning, listings, emptiness check) so those always work. Flags the wrapper controls itself are refused, see [Usage](#usage) |
 
 Changing the filter rules (or `local`/`remote`) requires one resync. The
 script detects this and offers the resync on the next interactive run.
@@ -104,6 +104,14 @@ script detects this and offers the resync on the next interactive run.
 ./webde_sync.py ~/Docs webde:/Docs --filter '- *.tmp'   # ad-hoc, without profile
 ./webde_sync.py docs -- --tpslimit 4 --bwlimit 2M       # extra rclone flags (bisync + most calls)
 ```
+
+Some rclone flags are set by the wrapper and are refused in `rclone_flags` and
+after `--`, because they would silently override its preview, baseline or
+report: `--force`, `--resync` (`-1`), `--resync-mode`, `--dry-run` (`-n`),
+`--interactive` (`-i`), `--filters-file`, `--backup-dir1`, `--backup-dir2`,
+`--workdir`, `--log-file` and `--use-json-log`. Use the wrapper's own options
+and profile keys instead (`--force`, `--resync`, `-n`, `resync_mode`,
+`filters`, `backups`).
 
 ### First run
 
@@ -171,7 +179,7 @@ Exit codes:
 | Code | Meaning |
 | --- | --- |
 | 0 | success, or everything already in sync |
-| 1 | sync failed, safety abort, or `--verify` found differences |
+| 1 | sync failed or could not run (safety abort, resync needed, another run of the profile in progress, rclone missing or too old, state directory not writable, ...), or `--verify` found differences |
 | 2 | usage or configuration error |
 | 3 | aborted at a prompt |
 | 130 | interrupted (Ctrl-C); the next run continues |
@@ -189,13 +197,14 @@ Exit codes:
 | Abort if one side is completely empty (unmounted disk, wrong path) | rclone bisync |
 | Replaced and deleted files are moved to `.webde-sync-backup/<time>/` on their side | rclone bisync, enabled by the wrapper |
 | Resume after a crash or Ctrl-C without a resync (`--resilient --recover`) | rclone bisync, enabled by the wrapper |
-| Preview and confirmation; `--force` only with a reviewed preview | wrapper |
+| Preview and confirmation; `--force` only with a reviewed preview, also not via `rclone_flags` or `--` | wrapper |
 | One run per profile (`flock`, inherited by rclone); stale bisync locks removed safely | wrapper |
 | First run and filter changes are never done silently by `-y` | wrapper |
 | Overwrites are counted exactly in the preview, also in a resync and with backups off | wrapper |
 | Changes that happened between preview and sync are reported after the run | wrapper |
-| Credentials inside the REMOTE string are refused; plain `http://` remotes get a warning | wrapper |
+| Common credential parameters inside the REMOTE string are refused: parameter names containing `pass`, `token` or `secret`, and the name `key` (best effort, not a complete list). Plain `http://` remotes get a warning | wrapper |
 | A vanished remote folder is an error, not a reason to delete local files | wrapper |
+| File names that imitate rclone's messages (`Failed to bisync.txt`) do not change the run's outcome | wrapper |
 | Same-size edits are uploaded (`--ignore-times`) | wrapper |
 | State and logs in `~/.local/state/webde-sync/` with mode `0700` | wrapper |
 
@@ -250,11 +259,20 @@ server they count against the web.de quota until they are pruned after
 | Path | Content |
 | --- | --- |
 | `~/.config/webde-sync/profiles.toml` | profiles (`--config` or `$WEBDE_SYNC_CONFIG` to override) |
-| `~/.local/state/webde-sync/<profile>/baseline.json` | record of the last resync (paths, filter rules, rclone version) |
-| `~/.local/state/webde-sync/<profile>/bisync/` | bisync's listings and lock |
-| `~/.local/state/webde-sync/<profile>/filters.txt` | generated filter rules |
-| `~/.local/state/webde-sync/<profile>/logs/` | one readable log per run (last 30) |
+| `~/.local/state/webde-sync/<state>/baseline.json` | record of the last resync (paths, filter rules, rclone version) |
+| `~/.local/state/webde-sync/<state>/bisync/` | bisync's listings and lock |
+| `~/.local/state/webde-sync/<state>/filters.txt` | generated filter rules (bisync adds `filters.txt.md5`) |
+| `~/.local/state/webde-sync/<state>/logs/` | one readable log per run (last 30) |
+| `~/.local/state/webde-sync/<state>/lock` | the wrapper's lock: one run per profile |
+| `~/.local/state/webde-sync/<state>/last-stamp` | time stamp of the last run, so each run gets its own backup folder |
 | `<local>/.webde-sync-backup/`, `<remote>/.webde-sync-backup/` | backups of replaced and deleted files |
+
+`<state>` is the profile name followed by a short hash of it, e.g.
+`docs-46b42b42/` for the profile `docs`; characters other than letters,
+digits, `_`, `.` and `-` in the name become `_`. Ad-hoc runs
+(`LOCAL_DIR REMOTE`) use `adhoc-<hash>/`, with a hash of the folder pair.
+`$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` replace `~/.config` and
+`~/.local/state` if they are set.
 
 ## Development
 
@@ -275,7 +293,9 @@ and resolved), conflict reminders, backup layout and listing, previews of
 files >= 1 KiB, overwrite warnings without backups, `check_access`, special
 file names, unreadable files, file/folder name clashes, the whole drive as
 remote, rclone upgrades, empty sides, rclone flags via `--` (including backup
-pruning under filter flags), stale-listing cleanup on resync, http warnings,
+pruning under filter flags, refused wrapper-owned flags, and the filter flag
+list against `rclone help flags`), file names that imitate rclone messages,
+stale-listing cleanup on resync, http warnings,
 changes between preview and sync, safety aborts, `--verify`, profiles, backup
 pruning, locking, Ctrl-C (also during a resync), and an encrypted rclone
 config.
