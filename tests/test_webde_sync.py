@@ -36,11 +36,18 @@ SERVER = os.environ.get("WEBDE_SYNC_TEST_SERVER") or (RCLONES[0] if RCLONES else
 
 # ------------------------------------------------------------------ unit tests
 
-def jl(msg: str, level: str = "notice", obj: str | None = None) -> str:
-    d = {"level": level, "msg": msg}
+def jl(msg: str, level: str = "notice", obj: str | None = None, **fields) -> str:
+    d = {"level": level, "msg": msg, **fields}
     if obj:
         d["object"] = obj
     return json.dumps(d)
+
+
+def skipped(action: str, obj: str, size: int) -> str:
+    """A dry-run entry as rclone logs it (sizes >= 1 KiB are shown with units)."""
+    shown = str(size) if size < 1024 else f"{size / 1024:.3f}Ki"
+    return jl(f"Skipped {action} as --dry-run is set (size {shown})", obj=obj,
+              skipped=action, size=size)
 
 
 def parse(lines, local="/data/local", remote="webde:sync"):
@@ -56,14 +63,17 @@ def test_parse_normal_run_with_ansi_and_absolute_local_paths():
         jl("- Path1    Queue copy to Path2       - webde:sync/a b - c.txt"),
         jl("- Path2    Queue delete              - webde:sync/gone.txt"),
         jl("- Path2    Queue copy to Path1       - /data/local/sub/new.txt"),
-        jl("Skipped copy as --dry-run is set (size 12)", obj="sub/new.txt"),
+        skipped("copy", "sub/new.txt", 50000),
+        skipped("move", "a b - c.txt", 1500),
+        skipped("copy", "a b - c.txt", 2048),
         jl("Can't follow symlink without -L/--copy-links", "warning", obj="link"),
         jl("Bisync successful", "info"),
     ])
     assert rep.upload == {"a b - c.txt": "changed: size (larger), time (newer)"}
     assert rep.download == {"sub/new.txt": "new"}
     assert rep.delete_remote == ["gone.txt"] and rep.delete_local == []
-    assert rep.sizes == {"sub/new.txt": 12}
+    assert rep.sizes == {"sub/new.txt": 50000, "a b - c.txt": 2048}
+    assert rep.replaced == {"a b - c.txt"}
     assert rep.symlinks == ["link"]
     assert rep.success and not rep.errors and rep.bisync_changes == 2
 
@@ -89,27 +99,92 @@ def test_parse_conflicts_restores_and_identical_files():
     assert rep.upload == {} and rep.n_actions == 2
 
 
-def test_parse_resolved_conflict_names_the_winner():
+def test_parse_resolved_conflict_names_the_winner_and_is_counted_once():
     rep = parse([
+        jl("- Path1    File changed: size (larger) - d/edit.txt"),
         jl("- WARNING  New or changed in both paths       - d/edit.txt"),
+        jl("- Path1    Queue copy to Path2       - webde:sync/d/edit.txt"),
         jl("- Path2    Queue copy to Path1       - /data/local/d/edit.txt.conflict3"),
+        skipped("copy", "d/edit.txt", 11),
+        skipped("move", "d/edit.txt", 13),
     ])
     assert rep.conflicts == {"d/edit.txt": [("d/edit.txt.conflict3", "server")]}
+    assert rep.upload == {} and rep.download == {} and rep.n_actions == 1
+    assert rep.replaced == set()
     assert ws.conflict_text("d/edit.txt", rep.conflicts["d/edit.txt"]) == (
         "changed on both sides: edit.txt = local version, edit.txt.conflict3 = server version")
 
 
-def test_parse_resync_copies_and_errors():
+def test_parse_resync_copies_large_files_and_errors():
     rep = parse([
         jl("- Path2    Resync is copying files to         - Path1", "info"),
-        jl("Skipped copy as --dry-run is set (size 1)", obj="remote.txt"),
+        skipped("copy", "remote.txt", 1),
         jl("- Path1    Resync is copying files to         - Path2", "info"),
+        skipped("copy", "photo.jpg", 50000),
         jl("Copied (new)", "info", obj="local.txt"),
         jl("Bisync aborted. Must run --resync to recover.", "error"),
         "panic: something not json",
     ], remote="webde:")
-    assert rep.download == {"remote.txt": "resync"} and rep.upload == {"local.txt": "resync"}
+    assert rep.download == {"remote.txt": "resync"}
+    assert rep.upload == {"photo.jpg": "resync", "local.txt": "resync"}
+    assert rep.sizes["photo.jpg"] == 50000
     assert rep.needs_resync and len(rep.errors) == 2
+
+
+def test_parse_stats_transfer_count():
+    rep = parse([jl("\nTransferred:   \t    2.955 KiB / 2.955 KiB, 100%, 0 B/s, ETA -\n"
+                    "Checks:                 2 / 2, 100%\nTransferred:            3 / 3, 100%\n"
+                    "Elapsed time:         0.0s\n", "info")])
+    assert rep.stats_transfers == 3
+
+
+def test_general_flags_drop_bisync_only_flags():
+    flags = ["--tpslimit", "4", "--compare", "size", "--conflict-loser=num", "--resilient",
+             "--config", "/x.conf", "-1", "--max-lock", "2m", "-v"]
+    assert ws.general_flags(flags) == ["--tpslimit", "4", "--config", "/x.conf", "-v"]
+
+
+@pytest.mark.parametrize("url, plain", [
+    ("http://webdav.example.org", True), ("HTTP://10.0.0.5:8080/dav", True),
+    ("https://webdav.smartdrive.web.de", False), ("http://127.0.0.1:18080", False),
+    ("http://localhost/dav", False), ("http://[::1]:80", False), ("", False),
+])
+def test_plain_http_url(url, plain):
+    assert ws.plain_http_url(url) is plain
+
+
+@pytest.mark.parametrize("remote", [":webdav,url=https://x,pass=abc:", "webde,pass=abc:/x",
+                                    ":s3,secret_access_key=abc:b", ":sftp,key=abc:"])
+def test_inline_credentials_are_rejected(remote):
+    with pytest.raises(ws.UsageError, match="credentials"):
+        ws.check_remote_configured(None, remote)
+
+
+def test_stale_lock_with_reused_pid_is_removed(tmp_path, capsys):
+    st = ws.State(tmp_path)
+    st.workdir.mkdir()
+    lck = st.workdir / "x.lck"
+    lck.write_text(json.dumps({"PID": str(os.getpid())}))   # alive, but not rclone
+    assert not ws.is_rclone_bisync(os.getpid())
+    ws.clear_stale_bisync_locks(st)
+    assert not lck.exists() and "stale" in capsys.readouterr().err
+
+
+def test_pending_conflicts_come_from_bisync_listing(tmp_path):
+    local = tmp_path / "local"
+    (local / "d").mkdir(parents=True)
+    for name in ("d/a.txt.conflict1", 'q"x.conflict2'):
+        (local / name).write_text("x")
+    st = ws.State(tmp_path / "st")
+    st.workdir.mkdir(parents=True)
+    (st.workdir / "l..r.path1.lst").write_text(
+        '# bisync listing v1 from 2026-11-23\n'
+        '-        1 - - 2026-11-23T19:25:59.000000000+0000 "d/a.txt.conflict1"\n'
+        '-        1 - - 2026-11-23T19:25:59.000000000+0000 "q\\"x.conflict2"\n'
+        '-        1 - - 2026-11-23T19:25:59.000000000+0000 "gone.txt.conflict1"\n'
+        '-        1 - - 2026-11-23T19:25:59.000000000+0000 "plain.txt"\n')
+    p = ws.Profile(name="p", local=local, remote="r:")
+    assert ws.pending_conflicts(p, st) == ["d/a.txt.conflict1", 'q"x.conflict2']
 
 
 def test_relativizer_handles_remote_root_forms():
@@ -237,11 +312,13 @@ def test_first_run_needs_interactive_resync_and_creates_remote(env):
     import shutil
     shutil.rmtree(env.server / "sync")
     env.put(env.local, "a.txt", "a\n")
+    (env.local / "photo.jpg").write_bytes(os.urandom(50_000))
     r = env.sync("-y")
     assert r.returncode == 1 and "resync is needed" in r.stderr
     r = env.sync(answers="y\ny\n")                     # create folder, apply
     assert r.returncode == 0, r.stdout + r.stderr
     assert "RESYNC" in r.stdout and "a.txt   [resync" in r.stdout
+    assert "photo.jpg   [resync, 48.8 KiB]" in r.stdout and "Apply these 2 change(s)" in r.stdout
     assert env.remote("a.txt").read_text() == "a\n"
     assert "Everything is in sync." in env.sync().stdout
 
@@ -331,6 +408,7 @@ def test_resolved_conflict_reports_winner_and_loser(env):
     r = env.run("p", answers="y\n")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "edit.txt = local version, edit.txt.conflict1 = server version" in r.stdout
+    assert "Apply these 1 change(s)" in r.stdout and "will be replaced" not in r.stdout
     assert env.remote("edit.txt").read_text() == "local edit\n"
     assert (env.local / "edit.txt.conflict1").read_text() == "server edit!\n"
 
@@ -375,6 +453,9 @@ def test_verify_reports_same_size_server_edit_bisync_cannot_see(env):
     assert "Everything is in sync." in env.sync().stdout   # rclone limitation
     r = env.sync("--verify", "-y")
     assert r.returncode == 1 and "content differs:" in r.stdout and "doc.txt" in r.stdout
+    assert "rclone copyto webde:sync/doc.txt" in r.stdout
+    r = env.sync("--verify", "-y", "--max-show", "0")
+    assert "... and 1 more (use --list-all)" in r.stdout
 
 
 def test_profile_mode_filters_and_resync_on_filter_change(env):
@@ -435,6 +516,8 @@ def test_usage_errors(env):
     r = env.run(str(env.local), "local-dir")
     assert r.returncode == ws.EXIT_USAGE and "NAME:path" in r.stderr
     assert env.run("nosuchprofile").returncode == ws.EXIT_USAGE
+    r = env.run(str(env.local), ":webdav,url=http://x,pass=abc:")
+    assert r.returncode == ws.EXIT_USAGE and "credentials" in r.stderr
     r = env.sync("--yes", "--force")
     assert r.returncode == ws.EXIT_USAGE and "reviewed preview" in r.stderr
 
@@ -486,3 +569,95 @@ def test_ctrl_c_stops_cleanly_and_next_run_completes(env):
     assert r.returncode == 0, r.stdout + r.stderr
     for name in ("big1.bin", "big2.bin"):
         assert env.remote(name).read_bytes() == (env.local / name).read_bytes()
+
+
+def write_profile(env: Env, name: str, **keys) -> None:
+    cfg = env.tmp / "cfg" / ws.APP
+    cfg.mkdir(parents=True, exist_ok=True)
+    body = "".join(f"{k} = {json.dumps(v)}\n" for k, v in keys.items())
+    with open(cfg / "profiles.toml", "a") as f:
+        f.write(f'[{name}]\nlocal = "{env.local}"\nremote = "webde:sync"\n{body}')
+
+
+def test_resync_overwrite_is_announced_and_permanent_without_backups(env):
+    write_profile(env, "nb", backups=False)
+    env.put(env.local, "doc.txt", "the local version\n")
+    env.put(env.server, "sync/doc.txt", "server\n")
+    r = env.run("nb", answers="y\n")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "overwritten PERMANENTLY" in r.stdout
+    assert "1 file(s) will be replaced and 0 deleted PERMANENTLY" in r.stderr
+    assert env.remote("doc.txt").read_text() == "the local version\n"
+    assert not (env.server / "sync" / ws.BACKUP_DIR).exists()
+
+
+def test_check_access_marker_is_created_only_after_confirmation(env):
+    write_profile(env, "ca", check_access=True)
+    env.put(env.local, "a.txt", "a\n")
+    assert env.run("ca", "-n").returncode == 0
+    assert env.run("ca", answers="n\n").returncode == ws.EXIT_ABORTED
+    assert not (env.local / "RCLONE_TEST").exists()
+    r = env.run("ca", answers="y\n")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (env.local / "RCLONE_TEST").exists() and env.remote("RCLONE_TEST").exists()
+    env.put(env.local, "b.txt", "b\n")
+    r = env.run("ca", "-y")                            # normal run with --check-access
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert env.remote("b.txt").exists()
+
+
+def test_rclone_flags_after_double_dash_reach_every_rclone_call(env):
+    conf = Path(env.env.pop("RCLONE_CONFIG"))
+    env.env["HOME"] = str(env.tmp)                     # no default config to fall back to
+    env.put(env.local, "a.txt", "a\n")
+    r = env.sync("--resync", "-y", "--", "--config", str(conf))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert env.remote("a.txt").exists()
+
+
+def test_plain_http_remote_is_warned_about(env):
+    conf = Path(env.env["RCLONE_CONFIG"])
+    conf.write_text(conf.read_text() + "[plain]\ntype = webdav\n"
+                    "url = http://nonexistent.invalid\nvendor = other\n")
+    r = env.run(str(env.local), "plain:x", "-n", "--", "--contimeout", "1s",
+                "--low-level-retries", "1", "--retries", "1")
+    assert "plain http://" in r.stderr
+    assert "plain http://" not in env.sync("-n").stderr   # 127.0.0.1 is fine
+
+
+def test_changes_between_preview_and_sync_are_reported(env):
+    env.baseline()
+    env.put(env.local, "planned.txt", "p\n")
+    p = subprocess.Popen([sys.executable, str(SCRIPT), str(env.local), "webde:sync"],
+                         env=env.env, text=True, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    seen = ""
+    while not seen.endswith("[y/N] "):
+        ch = p.stdout.read(1)
+        assert ch, seen
+        seen += ch
+    env.put(env.local, "late.txt", "l\n")              # appears after the preview
+    out, err = p.communicate("y\n", timeout=60)
+    assert p.returncode == 0, seen + out + err
+    assert "files changed between the preview and the sync" in err
+    assert "uploaded: late.txt" in err and env.remote("late.txt").exists()
+
+
+def test_ctrl_c_during_resync_says_it_will_repeat(env):
+    import signal
+    for name in ("big1.bin", "big2.bin"):
+        (env.local / name).write_bytes(os.urandom(6_000_000))
+    p = subprocess.Popen([sys.executable, str(SCRIPT), str(env.local), "webde:sync",
+                          "--resync", "-y", "--", "--bwlimit", "1M", "--transfers", "1"],
+                         env=env.env, text=True, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    time.sleep(3)
+    os.killpg(p.pid, signal.SIGINT)
+    out = p.communicate(timeout=60)[0]
+    assert p.returncode == 130, out
+    assert "the resync did not finish, so the next run repeats it" in out
+    r = env.sync("-y")
+    assert r.returncode == 1 and "resync is needed" in r.stderr
+    r = env.sync(answers="y\n")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert env.remote("big2.bin").read_bytes() == (env.local / "big2.bin").read_bytes()

@@ -27,12 +27,14 @@ See README.md for setup.
 from __future__ import annotations
 
 import argparse
+import ast
 import fcntl
 import getpass
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -209,12 +211,16 @@ class Rclone:
         self.binary = binary
         self.env = dict(os.environ)
         self.pass_fds: tuple[int, ...] = ()   # the profile lock, inherited by rclone
+        self.flags: list[str] = []            # user flags valid for every command
 
     def cmd(self, args: list[str]) -> list[str]:
         return [self.binary, *args]
 
-    def run(self, args: list[str], check: bool = True) -> subprocess.CompletedProcess:
-        proc = subprocess.run(self.cmd(args), capture_output=True, text=True, check=False,
+    def run(self, args: list[str], check: bool = True,
+            add_flags: bool = True) -> subprocess.CompletedProcess:
+        proc = subprocess.run(self.cmd(args + (self.flags if add_flags else [])),
+                              capture_output=True, text=True,
+                              check=False,
                               stdin=subprocess.DEVNULL, env=self.env, pass_fds=self.pass_fds)
         if check and proc.returncode != 0:
             raise SyncError(f"`rclone {' '.join(args)}` failed (exit {proc.returncode}):\n"
@@ -227,6 +233,31 @@ class Rclone:
         if not m:
             raise SyncError(f"cannot determine the rclone version from: {out[:80]!r}")
         return int(m[1]), int(m[2]), int(m[3])
+
+
+# Flags that only `rclone bisync` knows; other commands (lsf, check, ...) reject them.
+BISYNC_VALUE_FLAGS = {"--backup-dir1", "--backup-dir2", "--check-filename", "--check-sync",
+                      "--compare", "--conflict-loser", "--conflict-resolve", "--conflict-suffix",
+                      "--filters-file", "--max-lock", "--resync-mode", "--workdir"}
+BISYNC_BOOL_FLAGS = {"--check-access", "--create-empty-src-dirs", "--download-hash", "--force",
+                     "--ignore-listing-checksum", "--max-delete-renames-aware", "--no-cleanup",
+                     "--no-slow-hash", "--recover", "--remove-empty-dirs", "--resilient",
+                     "--resync", "-1", "--slow-hash-sync-only"}
+
+
+def general_flags(flags: list[str]) -> list[str]:
+    """Drop bisync-only flags (and their values) from a user flag list."""
+    out, skip_value = [], False
+    for f in flags:
+        if skip_value:
+            skip_value = False
+            continue
+        name = f.split("=", 1)[0]
+        if name in BISYNC_VALUE_FLAGS:
+            skip_value = "=" not in f
+        elif name not in BISYNC_BOOL_FLAGS:
+            out.append(f)
+    return out
 
 
 def find_rclone(explicit: str | None) -> Rclone:
@@ -274,7 +305,13 @@ def ensure_config_password(rc: Rclone) -> None:
         raise SyncError(f"cannot unlock rclone.conf: {proc.stderr.strip()}")
 
 
+RE_INLINE_SECRET = re.compile(r"[,:]\s*([A-Za-z_]*(?:pass|token|secret)[A-Za-z_]*|key)\s*=", re.IGNORECASE)
+
+
 def check_remote_configured(rc: Rclone, remote: str) -> None:
+    if RE_INLINE_SECRET.search(remote):
+        raise UsageError("REMOTE contains credentials; they would end up in the output, logs "
+                         "and state files -- configure them with `rclone config` instead")
     if ":" not in remote:
         raise UsageError(f"REMOTE {remote!r} is not an rclone remote path "
                          "(expected NAME:path, e.g. webde:/Documents)")
@@ -287,6 +324,29 @@ def check_remote_configured(rc: Rclone, remote: str) -> None:
     if f"{name}:" not in configured:
         raise UsageError(f"rclone remote '{name}:' is not configured (have: "
                          f"{' '.join(configured) or 'none'}) -- run `rclone config`")
+
+
+def plain_http_url(url: str) -> bool:
+    """True for http:// URLs that leave this machine (password + files unencrypted)."""
+    m = re.match(r"\s*http://(\[[^\]]*\]|[^/:]*)", url, re.IGNORECASE)
+    return bool(m) and m[1].lower() not in ("localhost", "[::1]") \
+        and not m[1].startswith("127.")
+
+
+def warn_plain_http(rc: Rclone, remote: str) -> None:
+    if remote.startswith(":"):
+        urls = re.findall(r"url\s*=\s*['\"]?([^,'\"]+)", remote)
+    else:
+        # `config dump` is read in memory only; nothing of it is printed or stored
+        proc = rc.run(["config", "dump"], check=False)
+        try:
+            section = json.loads(proc.stdout).get(remote.split(":", 1)[0].split(",", 1)[0], {})
+        except (ValueError, AttributeError):
+            section = {}
+        urls = [section.get("url", "")]
+    if any(plain_http_url(u) for u in urls):
+        warn(f"{remote} uses plain http://: your password and all files travel unencrypted "
+             "-- use https:// (web.de: https://webdav.smartdrive.web.de)")
 
 
 def remote_dir_exists(rc: Rclone, remote: str) -> bool:
@@ -358,6 +418,16 @@ class ProfileLock:
         os.close(self.fd)
 
 
+def is_rclone_bisync(pid: int) -> bool:
+    """Whether PID is a running `rclone bisync` (a reused PID of another program is not)."""
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    return bool(argv) and b"rclone" in Path(os.fsdecode(argv[0])).name.encode() \
+        and b"bisync" in argv[1:]
+
+
 def clear_stale_bisync_locks(st: State) -> None:
     """Remove bisync lock files left behind by killed runs (we hold the profile lock)."""
     for lck in st.workdir.glob("*.lck"):
@@ -365,16 +435,9 @@ def clear_stale_bisync_locks(st: State) -> None:
             pid = int(json.loads(lck.read_text(encoding="utf-8")).get("PID", 0))
         except (OSError, ValueError, TypeError, AttributeError):
             pid = 0
-        if pid > 0:
-            try:
-                os.kill(pid, 0)
-                raise SyncError(f"rclone (PID {pid}) still holds the bisync lock {tilde(lck)}"
-                                " -- wait for it to finish")
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                raise SyncError(f"bisync lock {tilde(lck)} belongs to running PID {pid}") \
-                    from None
+        if pid > 0 and is_rclone_bisync(pid):
+            raise SyncError(f"rclone bisync (PID {pid}) still holds the lock {tilde(lck)} "
+                            "-- wait for it to finish")
         lck.unlink(missing_ok=True)
         warn("removed a stale bisync lock left by an interrupted run")
 
@@ -450,7 +513,10 @@ def bisync_args(profile: Profile, st: State, *, resync: bool, dry_run: bool, for
         a.append("--ignore-times")
         if profile.check_access:
             a.append("--check-access")
-    if profile.backups:
+    # A dry-run moves nothing, but with backup dirs set rclone reports every file it
+    # would overwrite ("skipped: move") -- so the preview can count replacements
+    # even when backups are off for the real run.
+    if profile.backups or dry_run:
         a += ["--backup-dir1", str(profile.local / BACKUP_DIR / stamp),
               "--backup-dir2", remote_join(profile.remote, f"{BACKUP_DIR}/{stamp}")]
     if profile.sync_empty_dirs:
@@ -468,11 +534,11 @@ RE_QCOPY = re.compile(r"^- (Path[12])\s+Queue copy to (Path[12])\s+- (.+)$")
 RE_QDEL = re.compile(r"^- (Path[12])\s+Queue delete\s+- (.+)$")
 RE_BOTH = re.compile(r"^- WARNING\s+New or changed in both paths\s+- (.+)$")
 RE_RESYNC_DIR = re.compile(r"^- (Path[12])\s+Resync is copying files to\s+- (Path[12])")
-RE_SKIP_COPY = re.compile(r"^(.+): Skipped copy as --dry-run is set \(size (\d+)\)$")
 RE_COPIED = re.compile(r"^(.+): Copied \((?:new|replaced existing)\)")
 RE_SYMLINK = re.compile(r"^(.+): Can't follow symlink")
 RE_CONFLICT_COPY = re.compile(r"^(.+)\.conflict\d+$")
 RE_SUMMARY = re.compile(r"^Path[12]:\s+(\d+) changes:")
+RE_STATS_COUNT = re.compile(r"^Transferred:\s+(\d+) / \d+,", re.MULTILINE)   # file count, not bytes
 IGNORED_WARNINGS = ("bisync is IN BETA", "Modtime compare was requested")
 
 
@@ -486,6 +552,8 @@ class Report:
     # original path -> [(conflict copy, "local"/"server" = whose version it holds)]
     conflicts: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     sizes: dict[str, int] = field(default_factory=dict)
+    replaced: set[str] = field(default_factory=set)   # existing files that get overwritten
+    stats_transfers: int = 0      # file count from bisync's own statistics
     symlinks: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -519,33 +587,51 @@ def _relativizer(local: Path, remote: str):
     return rel
 
 
-def log_messages(lines) -> list[tuple[str, str]]:
-    """(level, message) from rclone --use-json-log lines; raw lines count as errors."""
+@dataclass
+class Msg:
+    """One rclone log entry; `text` is "object: msg" without ANSI codes."""
+    level: str
+    text: str
+    obj: str = ""
+    size: int | None = None       # exact bytes (msg itself shows e.g. "48.828Ki")
+    skipped: str = ""             # dry-run action: copy, move (= backup), ...
+
+
+def log_messages(lines) -> list[Msg]:
+    """Entries of rclone --use-json-log lines; non-JSON lines count as errors."""
     out = []
     for line in lines:
         line = line.rstrip("\n")
         if not line.strip():
             continue
         try:
-            obj = json.loads(line)
-            msg = str(obj.get("msg", ""))
-            if obj.get("object"):          # the file name is a separate JSON field
-                msg = f"{obj['object']}: {msg}"
-            out.append((str(obj.get("level", "")), ANSI.sub("", msg)))
+            o = json.loads(line)
+            msg, obj = ANSI.sub("", str(o.get("msg", ""))), str(o.get("object") or "")
+            size = o.get("size")
+            out.append(Msg(str(o.get("level", "")), f"{obj}: {msg}" if obj else msg, obj,
+                           size if isinstance(size, int) else None, str(o.get("skipped") or "")))
         except (ValueError, AttributeError):
-            out.append(("raw", ANSI.sub("", line)))
+            out.append(Msg("raw", ANSI.sub("", line)))
     return out
 
 
-def parse_report(messages: list[tuple[str, str]], local: Path, remote: str) -> Report:
+def parse_report(messages: list[Msg], local: Path, remote: str) -> Report:
     rep, rel = Report(), _relativizer(local, remote)
     detect: dict[tuple[str, str], str] = {}
     both: set[str] = set()
     copies: list[tuple[str, str]] = []          # (target side, rel path)
     resync_target = None
-    for level, msg in messages:
-        text = msg.strip()
-        if m := RE_DETECT.match(text):
+    for entry in messages:
+        level, msg, text = entry.level, entry.text, entry.text.strip()
+        if entry.skipped and entry.obj:               # dry-run, structured fields
+            if entry.skipped == "copy":
+                if entry.size is not None:
+                    rep.sizes[entry.obj] = entry.size
+                if resync_target:
+                    copies.append((resync_target, entry.obj))
+            elif entry.skipped == "move":             # old version moved to the backup
+                rep.replaced.add(entry.obj)
+        elif m := RE_DETECT.match(text):
             kind = m[2]
             detect[(m[1], m[3])] = ("new" if kind == "File is new" else
                                     "deleted" if kind == "File was deleted" else
@@ -558,10 +644,6 @@ def parse_report(messages: list[tuple[str, str]], local: Path, remote: str) -> R
             both.add(m[1])
         elif m := RE_RESYNC_DIR.match(text):
             resync_target = m[2]
-        elif m := RE_SKIP_COPY.match(text):
-            rep.sizes[m[1]] = int(m[2])
-            if resync_target:
-                copies.append((resync_target, m[1]))
         elif (m := RE_COPIED.match(text)) and resync_target:
             copies.append((resync_target, m[1]))
         elif (m := RE_SYMLINK.match(text)) and rel("Path1", m[1]) not in rep.symlinks:
@@ -584,23 +666,29 @@ def parse_report(messages: list[tuple[str, str]], local: Path, remote: str) -> R
             rep.empty_side = True
         if "Transferred:" in msg and "Elapsed time" in msg:
             rep.stats = msg.strip("\n")
+            if m := RE_STATS_COUNT.search(rep.stats):
+                rep.stats_transfers = int(m[1])
         if level in ("error", "critical", "raw") or text.startswith("Failed to bisync"):
             rep.errors.append(text)
         elif level in ("warning", "notice") and "WARNING" in text and not RE_BOTH.match(text) \
                 and not any(w in text for w in IGNORED_WARNINGS):
             rep.warnings.append(text)
-    for target, path in dict.fromkeys(copies):      # dedupe, keep order
+    copies = list(dict.fromkeys(copies))           # dedupe, keep order
+    for target, path in copies:
         if (m := RE_CONFLICT_COPY.match(path)) and m[1] in both:
             # a renamed copy queued to Path2 is the local version and vice versa
             origin = "local" if target == "Path2" else "server"
             rep.conflicts.setdefault(m[1], []).append((path, origin))
-            continue
+    for target, path in copies:
+        if path in rep.conflicts or ((m := RE_CONFLICT_COPY.match(path)) and m[1] in both):
+            continue        # part of a conflict: the winner's copy is no separate change
         src, other = ("Path1", "Path2") if target == "Path2" else ("Path2", "Path1")
         reason = detect.get((src, path), "resync" if resync_target else "changed")
         if detect.get((other, path)) == "deleted":
             reason = ("restored: deleted on the server but changed locally" if src == "Path1"
                       else "restored: deleted locally but changed on the server")
         (rep.upload if target == "Path2" else rep.download)[path] = reason
+    rep.replaced -= rep.conflicts.keys()     # a conflict loser is renamed, not replaced
     return rep
 
 
@@ -650,15 +738,34 @@ def show_report(rep: Report, max_show: int | None, planned: bool) -> None:
         warn(w)
 
 
-def pending_conflicts(rc: Rclone, profile: Profile, st: State) -> list[str]:
-    """Conflict copies (*.conflictN) that still exist locally, from any run."""
-    proc = rc.run(["lsf", "-R", "--files-only", "--filter-from", str(st.filters),
-                   str(profile.local)], check=False)
-    return sorted(p for p in proc.stdout.splitlines() if RE_CONFLICT_COPY.match(p))
+def pending_conflicts(profile: Profile, st: State) -> list[str]:
+    """Conflict copies (*.conflictN) from bisync's last local listing that still
+    exist -- reuses bisync's listing instead of scanning the folder again."""
+    found = set()
+    for lst in st.workdir.glob("*.path1.lst"):
+        try:
+            lines = lst.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if ".conflict" not in line or '"' not in line:
+                continue
+            quoted = line[line.index('"'):]            # last field: Go-quoted path
+            try:
+                path = json.loads(quoted)
+            except ValueError:
+                try:
+                    path = ast.literal_eval(quoted)
+                except (ValueError, SyntaxError):
+                    continue
+            if isinstance(path, str) and RE_CONFLICT_COPY.match(path) \
+                    and (profile.local / path).exists():
+                found.add(path)
+    return sorted(found)
 
 
-def remind_conflicts(rc: Rclone, profile: Profile, st: State, max_show: int | None) -> None:
-    pending = pending_conflicts(rc, profile, st)
+def remind_conflicts(profile: Profile, st: State, max_show: int | None) -> None:
+    pending = pending_conflicts(profile, st)
     if not pending:
         return
     copies = "1 conflict copy waits" if len(pending) == 1 else f"{len(pending)} conflict copies wait"
@@ -730,11 +837,23 @@ def confirm(prompt: str) -> bool:
 
 
 def preview(rc: Rclone, args: list[str], profile: Profile) -> Report:
-    proc = rc.run(args + ["--use-json-log", "-v"], check=False)
+    proc = rc.run(args + ["--use-json-log", "-v"], check=False, add_flags=False)
     rep = parse_report(log_messages(proc.stderr.splitlines()), profile.local, profile.remote)
     if proc.returncode != 0 and not rep.errors:
         rep.errors.append(f"rclone bisync --dry-run failed with exit code {proc.returncode}")
     return rep
+
+
+def wait_for(proc: subprocess.Popen) -> tuple[int, bool]:
+    """Wait for rclone; on Ctrl-C (which rclone receives too) keep waiting while
+    it stops cleanly.  Returns (exit code, interrupted)."""
+    interrupted = False
+    while True:
+        try:
+            return proc.wait(), interrupted
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\ninterrupted -- waiting for rclone to stop cleanly ...", file=sys.stderr)
 
 
 def execute(rc: Rclone, args: list[str], profile: Profile, st: State, stamp: str) -> Report:
@@ -743,15 +862,7 @@ def execute(rc: Rclone, args: list[str], profile: Profile, st: State, stamp: str
     if sys.stdout.isatty():
         cmd.append("--progress")
     proc = subprocess.Popen(cmd, env=rc.env, stdin=subprocess.DEVNULL, pass_fds=rc.pass_fds)
-    user_interrupt = False
-    while True:
-        try:
-            code = proc.wait()
-            break
-        except KeyboardInterrupt:       # rclone got the SIGINT too and stops cleanly
-            user_interrupt = True
-            print("\ninterrupted -- waiting for rclone to stop (the next run resumes "
-                  "via bisync --recover) ...", file=sys.stderr)
+    code, user_interrupt = wait_for(proc)
     try:
         lines = log_json.read_text(encoding="utf-8", errors="replace").splitlines()
     except FileNotFoundError:
@@ -764,7 +875,7 @@ def execute(rc: Rclone, args: list[str], profile: Profile, st: State, stamp: str
     rep.interrupted = user_interrupt or code == 130
     rep.success = rep.success and code in (0, 130)
     with open(st.logs / f"{stamp}.log", "w", encoding="utf-8") as f:   # readable copy
-        f.writelines(f"{lvl.upper():<7} {msg}\n" for lvl, msg in messages)
+        f.writelines(f"{m.level.upper():<7} {m.text}\n" for m in messages)
     log_json.unlink(missing_ok=True)
     for old in sorted(st.logs.glob("*.log"))[:-KEEP_LOGS]:
         old.unlink()
@@ -788,18 +899,31 @@ def prune_backups(rc: Rclone, profile: Profile, now: datetime) -> None:
                 warn(str(e))
 
 
-def verify(rc: Rclone, profile: Profile, st: State, assume_yes: bool, extra: list[str],
+def verify(rc: Rclone, profile: Profile, st: State, assume_yes: bool,
            max_show: int | None) -> int:
     info("Verify compares the content of every file byte by byte. WebDAV offers no "
          "checksums, so this downloads ALL files once -- slow and heavy on big folders.")
     if not assume_yes and not confirm("Start the full content check?"):
         return EXIT_ABORTED
-    proc = rc.run(["check", str(profile.local), profile.remote, "--download",
-                   "--filter-from", str(st.filters), "--combined", "-", "--color", "NEVER",
-                   *profile.rclone_flags, *extra], check=False)
+    result = st.root / "verify.txt"          # inside the private state directory
+    cmd = rc.cmd(["check", str(profile.local), profile.remote, "--download",
+                  "--filter-from", str(st.filters), "--combined", str(result),
+                  "--color", "NEVER", *rc.flags])
+    if sys.stdout.isatty():
+        cmd.append("--progress")
+    proc = subprocess.Popen(cmd, env=rc.env, stdin=subprocess.DEVNULL, pass_fds=rc.pass_fds)
+    code, interrupted = wait_for(proc)
+    try:
+        lines = result.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        lines = []
+    result.unlink(missing_ok=True)
+    if interrupted:
+        info("Interrupted -- the content check is incomplete.")
+        return 130
     groups: dict[str, list[str]] = {"*": [], "+": [], "-": [], "!": []}
     same = 0
-    for line in proc.stdout.splitlines():
+    for line in lines:
         mark, _, path = line.partition(" ")
         if mark == "=":
             same += 1
@@ -809,19 +933,23 @@ def verify(rc: Rclone, profile: Profile, st: State, assume_yes: bool, extra: lis
               "!": "could not be compared"}
     info(f"  {'identical:':<24}{same:>6} file(s)")
     for mark, title in titles.items():
-        info(f"  {title + ':':<24}{len(groups[mark]):>6} file(s)")
-        limit = len(groups[mark]) if max_show is None else max_show
-        for p in groups[mark][:limit]:
+        paths = groups[mark]
+        info(f"  {title + ':':<24}{len(paths):>6} file(s)")
+        limit = len(paths) if max_show is None else max_show
+        for p in paths[:limit]:
             info(f"      {p}")
-    if proc.returncode not in (0, 1) or (proc.returncode == 1 and not any(groups.values())):
-        raise SyncError(f"rclone check failed:\n{proc.stderr.strip()}")
+        if len(paths) > limit:
+            info(f"      ... and {len(paths) - limit} more (use --list-all)")
+    if code not in (0, 1) or (code == 1 and not any(groups.values())):
+        raise SyncError(f"rclone check failed (exit {code}), see its messages above")
     if groups["*"]:
         p = groups["*"][0]
+        local_file = shlex.quote(str(profile.local / p))
         info("\nFiles whose content differs were changed without a size change, which "
              "bisync cannot\nsee on WebDAV. Decide per file which copy is right, then sync:\n"
-             f"  keep the local copy:  touch '{profile.local / p}'\n"
-             f"  keep the server copy: rclone copyto '{remote_join(profile.remote, p)}' "
-             f"'{profile.local / p}'")
+             f"  keep the local copy:  touch {local_file}\n"
+             f"  keep the server copy: rclone copyto "
+             f"{shlex.quote(remote_join(profile.remote, p))} {local_file}")
     if groups["+"] or groups["-"]:
         info("\nFiles on one side only are normally handled by the next sync (or were "
              "excluded/skipped); run a sync and verify again.")
@@ -911,8 +1039,10 @@ def run(args: argparse.Namespace, extra: list[str]) -> int:
     if profile.local == Path("/"):
         raise UsageError("refusing to sync the whole file system")
     rc = find_rclone(args.rclone)
+    rc.flags = general_flags(profile.rclone_flags + extra)   # e.g. --config, --timeout
     ensure_config_password(rc)
     check_remote_configured(rc, profile.remote)
+    warn_plain_http(rc, profile.remote)
     for mode in (profile.conflict_resolve, profile.resync_mode):
         if mode in ("newer", "older"):
             warn(f"'{mode}' compares modification times, but WebDAV servers like web.de "
@@ -926,10 +1056,77 @@ def run(args: argparse.Namespace, extra: list[str]) -> int:
         filters_text = render_filters(profile, st)
         write_if_changed(st.filters, filters_text)
         if args.verify:
-            return verify(rc, profile, st, args.yes, extra, max_show)
+            return verify(rc, profile, st, args.yes, max_show)
         return sync(rc, profile, st, args, extra, filters_text, max_show)
     finally:
         lock.release()
+
+
+def review(plan: Report, profile: Profile, resync: bool, stamp: str) -> int | None:
+    """Ask for confirmation of a previewed plan; None means: go ahead."""
+    unclear = plan.n_actions == 0 and (
+        plan.stats_transfers > 0 or (not resync and not (
+            plan.no_changes or plan.bisync_changes == 0 and not plan.plan_lines)))
+    if unclear:
+        # bisync plans something this wrapper could not classify (e.g. a changed
+        # log format in a newer rclone): never present that as "nothing to do".
+        warn("could not fully interpret bisync's plan; its own summary:")
+        for line in plan.plan_lines:
+            info(f"  {line}")
+        if plan.stats:
+            info(plan.stats)
+        prompt = "Apply bisync's plan as shown above?"
+    elif plan.n_actions == 0:
+        if not resync:
+            info("Everything is in sync.")
+            return EXIT_OK
+        prompt = "Create the baseline (no files need to be copied)?"
+    else:
+        deleted = len(plan.delete_remote) + len(plan.delete_local)
+        if plan.replaced or deleted:
+            what = f"{len(plan.replaced)} file(s) will be replaced and {deleted} deleted"
+            if profile.backups:
+                info(f"Note: {what}; the old versions are kept in {BACKUP_DIR}/{stamp}/ "
+                     "on the side where they change.")
+            else:
+                warn(f"{what} PERMANENTLY (backups are off in this profile)")
+        prompt = f"Apply these {plan.n_actions} change(s)?"
+    if not confirm(prompt):
+        info("Aborted, nothing was changed.")
+        return EXIT_ABORTED
+    return None
+
+
+def report_surprises(plan: Report, done: Report, max_show: int | None) -> None:
+    """Warn about actions bisync took that the confirmed preview did not show
+    (files changed between preview and sync)."""
+    pairs = (("uploaded", done.upload, plan.upload), ("downloaded", done.download, plan.download),
+             ("deleted on server", done.delete_remote, plan.delete_remote),
+             ("deleted locally", done.delete_local, plan.delete_local),
+             ("conflict", done.conflicts, plan.conflicts))
+    found = [(title, sorted(set(a) - set(b))) for title, a, b in pairs]
+    found = [(title, paths) for title, paths in found if paths]
+    if not found:
+        return
+    lines = [("warning: files changed between the preview and the sync -- bisync also did "
+              "(its safety checks still applied):")]
+    for title, paths in found:
+        limit = len(paths) if max_show is None else max_show
+        more = f" ... and {len(paths) - limit} more" if len(paths) > limit else ""
+        lines.append(f"    {title}: {', '.join(paths[:limit])}{more}")
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
+
+def ensure_check_file(rc: Rclone, profile: Profile) -> None:
+    """Create the check_access marker for a confirmed resync, unless a side has one."""
+    marker = profile.local / "RCLONE_TEST"
+    if not profile.check_access or marker.exists():
+        return
+    if rc.run(["lsjson", "--stat", remote_join(profile.remote, "RCLONE_TEST")],
+              check=False).returncode == 0:
+        return                          # the resync brings the server's marker down
+    marker.write_text("Marker file for webde_sync.py check_access -- do not delete.\n",
+                      encoding="utf-8")
 
 
 def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
@@ -949,9 +1146,11 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
     info(f"mode    : {'RESYNC' if resync else 'sync'}"
          + (f" ({problem})" if problem and resync else ""))
     if resync:
+        loser = ("is backed up" if profile.backups else
+                 "is overwritten PERMANENTLY, backups are off")
         info("          Merges both sides: files missing on one side are copied over; for "
-             f"files that\n          differ in size {winner} version wins (the other one is "
-             "backed up).\n          Nothing is deleted. Same-size files are assumed equal "
+             f"files that\n          differ in size {winner} version wins (the other one "
+             f"{loser}).\n          Nothing is deleted. Same-size files are assumed equal "
              "(check with --verify).")
     info()
 
@@ -965,56 +1164,28 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
         if not args.yes and not confirm(f"Create the remote folder {profile.remote}?"):
             return EXIT_ABORTED
         rc.run(["mkdir", profile.remote])
-    if resync and profile.check_access and not (profile.local / "RCLONE_TEST").exists():
-        (profile.local / "RCLONE_TEST").write_text(
-            "Marker file for webde_sync.py check_access -- do not delete.\n", encoding="utf-8")
 
     now = datetime.now().astimezone()
     stamp = now.strftime(STAMP_FMT)
     common = {"resync": resync, "force": args.force, "stamp": stamp, "extra": extra}
+    plan = None
     if not args.yes or args.dry_run:
-        rep = preview(rc, bisync_args(profile, st, dry_run=True, **common), profile)
+        plan = preview(rc, bisync_args(profile, st, dry_run=True, **common), profile)
         info("Overview" + (" (resync)" if resync else ""))
         info("========")
-        show_report(rep, max_show, planned=True)
+        show_report(plan, max_show, planned=True)
         info()
-        remind_conflicts(rc, profile, st, max_show)
-        if rep.errors:
-            advise(rep, profile, st)
+        remind_conflicts(profile, st, max_show)
+        if plan.errors:
+            advise(plan, profile, st)
             return EXIT_FAIL
         if args.dry_run:
             info("--dry-run: nothing was changed.")
             return EXIT_OK
-        if rep.n_actions == 0 and not resync:
-            if rep.no_changes or rep.bisync_changes == 0 and not rep.plan_lines:
-                info("Everything is in sync.")
-                return EXIT_OK
-            # bisync plans something this wrapper could not classify (e.g. a
-            # changed log format in a newer rclone): show bisync's own words.
-            warn("could not fully interpret bisync's plan; its own summary:")
-            for line in rep.plan_lines:
-                info(f"  {line}")
-            if not confirm("Apply bisync's plan as shown above?"):
-                info("Aborted, nothing was changed.")
-                return EXIT_ABORTED
-        elif rep.n_actions == 0:          # resync without transfers: still confirm
-            if not confirm("Create the baseline (no files need to be copied)?"):
-                info("Aborted, nothing was changed.")
-                return EXIT_ABORTED
-        else:
-            replaced = sum(why.startswith("changed")
-                           for why in (*rep.upload.values(), *rep.download.values()))
-            deleted = len(rep.delete_remote) + len(rep.delete_local)
-            if replaced or deleted:
-                what = f"{replaced} file(s) will be replaced and {deleted} deleted"
-                if profile.backups:
-                    info(f"Note: {what}; the old versions are kept in "
-                         f"{BACKUP_DIR}/{stamp}/ on the side where they change.")
-                else:
-                    warn(f"{what} PERMANENTLY (backups are off in this profile)")
-            if not confirm(f"Apply these {rep.n_actions} change(s)?"):
-                info("Aborted, nothing was changed.")
-                return EXIT_ABORTED
+        if (answer := review(plan, profile, resync, stamp)) is not None:
+            return answer
+    if resync:
+        ensure_check_file(rc, profile)
 
     info("Syncing ...")
     rep = execute(rc, bisync_args(profile, st, dry_run=False, **common), profile, st, stamp)
@@ -1025,8 +1196,12 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
         write_baseline(profile, st, filters_text, rc.version())
     log_note = f"log: {tilde(st.logs / (stamp + '.log'))}"
     if rep.interrupted:            # the queued lists are plans, not completed transfers
-        info("Interrupted -- bisync finished the running transfers and saved its state. "
-             "Run again to sync the rest (no --resync needed).")
+        if resync and not rep.success:
+            info("Interrupted -- the resync did not finish, so the next run repeats it "
+                 "(with a preview).")
+        else:
+            info("Interrupted -- bisync finished the running transfers and saved its state. "
+                 "Run again to sync the rest (no --resync needed).")
         show_backups(rc, profile, stamp, max_show)
         info(log_note)
         return 130
@@ -1038,8 +1213,10 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
     info("Done" + (" -- baseline created." if resync else "."))
     show_report(rep, max_show, planned=False)
     show_backups(rc, profile, stamp, max_show)
+    if plan is not None and not resync:
+        report_surprises(plan, rep, max_show)
     if rep.conflicts or args.yes:  # new conflicts, or no preview has shown the old ones
-        remind_conflicts(rc, profile, st, max_show)
+        remind_conflicts(profile, st, max_show)
     if profile.backups and profile.keep_backups_days:
         prune_backups(rc, profile, now)
     info(log_note)
