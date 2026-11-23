@@ -88,7 +88,7 @@ filters = ["- .git/**", "- *.tmp"]
 | `sync_empty_dirs` | `false` | also create and delete empty directories |
 | `conflict_resolve` | `none` | `none` keeps both copies; or `local`, `remote`, `larger`, `smaller`, ... |
 | `resync_mode` | `local` | which copy wins for differing files during `--resync` |
-| `rclone_flags` | `[]` | extra rclone flags, e.g. `["--tpslimit", "4"]`: applied to every rclone call; bisync-only flags only to bisync |
+| `rclone_flags` | `[]` | extra rclone flags, e.g. `["--tpslimit", "4"]`: bisync-only flags reach only bisync, and filter flags (`--exclude`, `--min-size`, ...) are kept away from the backup housekeeping calls (pruning, listings, emptiness check) so those always work |
 
 Changing the filter rules (or `local`/`remote`) requires one resync. The
 script detects this and offers the resync on the next interactive run.
@@ -102,7 +102,7 @@ script detects this and offers the resync on the next interactive run.
 ./webde_sync.py docs --verify   # byte-by-byte comparison of both sides
 ./webde_sync.py --list          # configured profiles
 ./webde_sync.py ~/Docs webde:/Docs --filter '- *.tmp'   # ad-hoc, without profile
-./webde_sync.py docs -- --tpslimit 4 --bwlimit 2M       # extra rclone flags (all rclone calls)
+./webde_sync.py docs -- --tpslimit 4 --bwlimit 2M       # extra rclone flags (bisync + most calls)
 ```
 
 ### First run
@@ -240,12 +240,17 @@ server they count against the web.de quota until they are pruned after
 - Not verified against the real web.de server: case-insensitive name
   collisions (`a.txt` vs `A.txt`), characters web.de rejects, and the
   error on a full quota (the script recognises HTTP 507 / "quota").
+  Before pointing a profile at primary folders, run one small smoke test
+  against a throwaway folder on web.de: a first resync, a two-way edit,
+  an overwrite and a deletion (check `.webde-sync-backup/<time>/`), and
+  a later run that prunes the old backups.
 
 ## Files
 
 | Path | Content |
 | --- | --- |
 | `~/.config/webde-sync/profiles.toml` | profiles (`--config` or `$WEBDE_SYNC_CONFIG` to override) |
+| `~/.local/state/webde-sync/<profile>/baseline.json` | record of the last resync (paths, filter rules, rclone version) |
 | `~/.local/state/webde-sync/<profile>/bisync/` | bisync's listings and lock |
 | `~/.local/state/webde-sync/<profile>/filters.txt` | generated filter rules |
 | `~/.local/state/webde-sync/<profile>/logs/` | one readable log per run (last 30) |
@@ -263,17 +268,18 @@ The integration tests in [`tests/test_webde_sync.py`](tests/test_webde_sync.py)
 run the script against `rclone serve webdav` with a `vendor = other` client
 remote. Like web.de, that server cannot store file times and reports upload
 times. The server is always rclone v1.66.0 (`WEBDE_SYNC_TEST_SERVER`), because
-`rclone serve webdav` v1.76.0 sometimes stalls for minutes when a file is moved
-into a new folder. That is a bug in the test server only, not in bisync. The tests cover the first run, two-way changes, same-size edits,
-conflicts (kept and resolved), conflict reminders, backup layout and listing,
-previews of files >= 1 KiB, overwrite warnings without backups, `check_access`,
-special file names, unreadable files, file/folder name clashes, the whole drive
-as remote, rclone upgrades, empty sides,
-rclone flags via `--`, http warnings, changes between preview and sync,
-safety aborts, `--verify`, profiles, backup pruning, locking,
-Ctrl-C (also during a resync), and an encrypted rclone config.
+`rclone serve webdav` v1.76.0 sometimes stalls for minutes when a file is
+moved into a new folder -- a bug in the test server only, not in bisync. The
+tests cover the first run, two-way changes, same-size edits, conflicts (kept
+and resolved), conflict reminders, backup layout and listing, previews of
+files >= 1 KiB, overwrite warnings without backups, `check_access`, special
+file names, unreadable files, file/folder name clashes, the whole drive as
+remote, rclone upgrades, empty sides, rclone flags via `--` (including backup
+pruning under filter flags), stale-listing cleanup on resync, http warnings,
+changes between preview and sync, safety aborts, `--verify`, profiles, backup
+pruning, locking, Ctrl-C (also during a resync), and an encrypted rclone
+config.
 
-[webde-sync-code-review.md](webde-sync-code-review.md) reviews this script
-for security, completeness, and ease of use; reviews of the earlier,
-self-written sync engine and of the first `rclone bisync` rewrite are
-preserved in git history.
+The script was reviewed externally at each stage -- the earlier, self-written
+sync engine, the first `rclone bisync` rewrite, and the current wrapper;
+those reviews are preserved in git history.
