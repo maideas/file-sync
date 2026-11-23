@@ -1,161 +1,110 @@
 # Code Review and Evaluation of `webde_sync.py`
 
-This document reviews [`webde_sync.py`](webde_sync.py) and evaluates whether it provides a **secure**, **complete**, and **easy-to-use** `rclone` wrapper for bidirectional file synchronization between a Linux PC and a web.de cloud drive (Online-Speicher via WebDAV).
+This document reviews the `rclone bisync` rewrite of [`webde_sync.py`](webde_sync.py) (commit `05fb4e3`, along with [`README.md`](README.md), [`Makefile`](Makefile), and [`tests/test_webde_sync.py`](tests/test_webde_sync.py)) and evaluates whether it provides a **secure**, **complete**, and **easy-to-use** wrapper for bidirectional file synchronization between a Linux PC and a web.de cloud drive (Online-Speicher via WebDAV).
+
+> **Note:** The earlier review of the superseded, self-written sync engine (commit `6658238`) is preserved in git history (commit `7ee89f4`).
 
 ## Verdict
 
-**Not ready for real use.** In its current form, [`webde_sync.py`](webde_sync.py) will crash immediately when run against `rclone`, silently loses data on concurrent two-way edits, conflicts fundamentally with how web.de WebDAV handles modification timestamps, and lacks essential data-safety guardrails.
+**Architecturally solid and very close to production-ready, with one major preview bug to fix before daily use.**
+
+Delegating synchronization to `rclone bisync` (`>= 1.66`) eliminates the data-loss and WebDAV-timestamp flaws of the initial version. `make lint` passes cleanly and all **49 tests** in [`tests/test_webde_sync.py`](tests/test_webde_sync.py) pass against `rclone v1.66.0` and `v1.76.0` using a local `rclone serve webdav` (`vendor = other`) server.
 
 | Criterion | Assessment | Summary |
 | --- | --- | --- |
-| **Security & Safety** | Insufficient | Path traversal and potential infinite loop in local deletion; unsafe remote `rmdirs`; no concurrency lock, backup/trash, or mass-deletion guardrail; state stored in `~/.cache` with default permissions. |
-| **Completeness** | Incomplete | Fails on real `rclone lsjson` output; breaks on web.de WebDAV `mtime` semantics; misses true three-way conflict detection; no WebDAV tuning, symlinks, empty-directory handling, or saved profiles. |
-| **Ease of Use** | Mixed | Clear overview concept, but zero transfer progress output, broken interactive deletion prompts, swapped preview sizes, confusing `0 file(s)` prompts, and missing setup documentation. |
+| **Security & Safety** | **Strong** | Three-way sync via `bisync`, per-run backups on both sides with retention pruning, keep-both conflicts + recurring reminders, `--max-delete` & empty-side aborts, `flock` inherited by `rclone`, `0700` state dirs in `$XDG_STATE_HOME`, encrypted `rclone.conf` support, vanished-remote check, `--force` blocked with `-y`. A few smaller edge cases remain (PID reuse in stale-lock cleanup, `RCLONE_TEST` created during `--dry-run`). |
+| **Completeness** | **Very Good** | TOML profiles, `--ignore-times` for WebDAV same-size edits, `--verify` byte check, `--resilient --recover` Ctrl-C resume, readable per-run logs, version & remote checks, clear [`README.md`](README.md). One major gap: `rclone` dry-run size parsing breaks on every file `>= 1 KiB`. |
+| **Ease of Use** | **Good** | Clean CLI, helpful error advice, live `--progress` on TTY, English/German `[y/N]` prompt (`y`/`yes`/`j`/`ja`), clear conflict & backup summaries. Slightly hurt by the `>= 1 KiB` preview bug and silent `--verify` downloads. |
 
 ---
 
-## 1. Critical Bugs (Broken Functionality & Data Loss)
+## 1. Real Bugs Found (Fix Before Daily Use)
 
-### 1.1 Crash on `rclone lsjson` JSON keys
+### 1.1 Major (verified live): `RE_SKIP_COPY` fails on every file `>= 1 KiB`
 
-In `listing()` ([`webde_sync.py`](webde_sync.py), lines 95–103), the parser expects camelCase or lowercase keys (`isDir`/`isdir`, `path`, `size`, `modTime`/`modtime`):
+In [`webde_sync.py`](webde_sync.py) (lines 471 and 561–564):
 
 ```python
-for e in entries:
-    if e.get("isDir") or e.get("isdir"):
-        continue
-    rel = e["path"]
-    ...
-    files[rel] = (int(e.get("size") or 0), parse_modtime(e.get("modTime") or e.get("modtime")))
+RE_SKIP_COPY = re.compile(r"^(.+): Skipped copy as --dry-run is set \(size (\d+)\)$")
 ```
-
-`rclone lsjson` outputs **PascalCase** keys (`Path`, `Size`, `ModTime`, `IsDir`). On any non-empty directory, `e["path"]` raises `KeyError: 'path'` immediately, and `IsDir`, `Size`, and `ModTime` are never matched.
-
-### 1.2 Inverted interactive deletion prompt
-
-In `main()` ([`webde_sync.py`](webde_sync.py), lines 383–392):
 
 ```python
-if n_deletes:
-    if args.prune or (args.yes and confirm(
-            f"Propagate {n_deletes} deletion(s) ({len(plan.delete_remote)} on server,"
-            f" {len(plan.delete_local)} locally)?")):
+elif m := RE_SKIP_COPY.match(text):
+    rep.sizes[m[1]] = int(m[2])
+    if resync_target:
+        copies.append((resync_target, m[1]))
 ```
 
-- **Default interactive mode** (`-y` and `--prune` both unset): `args.yes` is `False`, so `confirm(...)` is never called and deletions are always silently skipped.
-- **Non-interactive transfers** (`-y` set without `--prune`): contrary to the `--help` text (*"apply transfers without asking (deletions still need `--prune`)"*), the script blocks on an interactive `confirm(...)` prompt.
+For files of `1024` bytes or larger, `rclone` formats the log message with human units — e.g. `Skipped copy as --dry-run is set (size 48.828Ki)` (`Ki`, `Mi`, `Gi`, ...) — rather than raw digits.
 
-### 1.3 Swapped sides in the deletion preview
+- **Normal preview impact:** File sizes and total transfer sizes omit every file `>= 1 KiB`.
+- **First-run / `--resync` preview impact:** During `--resync --dry-run`, files are *only* added to the preview list inside `RE_SKIP_COPY`. Testing a `50 KB` file with `rclone v1.76.0 --resync-mode path1 --dry-run` yields `upload={}, download={}, n_actions=0, sizes={}`. On a first run over real documents or photos (all `>= 1 KiB`), the overview prints `no changes` and prompts `Create the baseline (no files need to be copied)? [y/N]` — and then uploads every file once confirmed.
+- **Why tests missed it:** Every preview test in [`tests/test_webde_sync.py`](tests/test_webde_sync.py) used tiny files (`< 1 KiB`); only `test_ctrl_c_stops_cleanly_and_next_run_completes` created multi-MB files and ran with `-y` (skipping the preview).
+- **Recommended fix:** `rclone --use-json-log` already emits structured `"size": 50000` (exact integer bytes) and `"skipped": "copy"` fields in the JSON payload. Preserve those fields in `log_messages()` instead of regex-parsing formatted units out of `msg`, and add a preview test with files `>= 1 KiB`.
 
-In `main()` ([`webde_sync.py`](webde_sync.py), lines 343–344):
+### 1.2 Moderate: `check_access = true` mutates the local folder during `--dry-run` and before confirmation
+
+In `sync()` ([`webde_sync.py`](webde_sync.py), lines 968–970):
 
 ```python
-("delete on server", plan.delete_remote, loc),
-("delete locally", plan.delete_local, rem),
+if resync and profile.check_access and not (profile.local / "RCLONE_TEST").exists():
+    (profile.local / "RCLONE_TEST").write_text(
+        "Marker file for webde_sync.py check_access -- do not delete.\n", encoding="utf-8")
 ```
 
-`plan.delete_remote` lists files present only on `rem` (already missing from `loc`), while `plan.delete_local` lists files present only in `loc` (already missing from `rem`). Because `loc` and `rem` are swapped, `show()` never finds any of these entries and reports every deletion as `[0 B, ?]` with a `0 B` total.
+- Runs *before* the `args.dry_run` return (line 985) and *before* user confirmation (line 1015), so `--resync --dry-run` or declining the prompt still creates `RCLONE_TEST` on disk despite reporting `nothing was changed`.
+- Can plant a marker file into an unmounted/empty mountpoint if `--resync` is invoked on it, or create a competing `RCLONE_TEST` when onboarding a second PC to a remote that already has one.
+- **Recommended fix:** Defer creating `RCLONE_TEST` until after confirmation (and skip if the remote already contains `RCLONE_TEST`).
 
-### 1.4 True two-way conflicts are not detected (silent data loss)
+### 1.3 Moderate: `clear_stale_bisync_locks()` can wedge permanently on PID reuse
 
-In `plan_sync()` ([`webde_sync.py`](webde_sync.py), lines 167–184), the `if in_l and in_r:` branch completely ignores the baseline `state` file:
+In `clear_stale_bisync_locks()` ([`webde_sync.py`](webde_sync.py), lines 361–380):
 
-- If a file is edited on Linux **and** also edited on web.de (or another device) since the last sync, the script silently overwrites the older edit with the newer one instead of flagging a conflict.
-- If a file is intentionally rolled back locally to an older `mtime` (e.g. via backup restore or version control), the unmodified remote copy silently overwrites the local file.
-- Only files with differing sizes and matching `mtime` values (within `--mtime-tolerance`, default `2.0` seconds) are currently detected as conflicts.
-
-### 1.5 Invalid `--files-from` + `--exclude` combination and filename mangling
-
-In `files_from_tmp()`, `rclone_copy()`, and `rclone_delete()` ([`webde_sync.py`](webde_sync.py), lines 237–262):
-
-- `rclone_copy()` passes both `--files-from` and `--exclude`. Combining `--files-from` with filter flags such as `--exclude` is unsupported in `rclone` (resulting in errors in modern versions) and is redundant because `listing()` already applied `--exclude`.
-- `--files-from` treats lines starting with `#` or `;` as comments and strips surrounding whitespace; **`--files-from-raw`** should be used for arbitrary filenames.
-- Filenames containing a literal newline (`\n`, valid on Linux filesystems) split into multiple lines in `files_from_tmp()`, creating a path-injection risk for `rclone delete`.
-
-### 1.6 Fundamental mismatch with web.de WebDAV `mtime` behavior
-
-web.de Online-Speicher via WebDAV (`https://webdav.web.de`) does not reliably preserve client modification timestamps on upload (it sets `getlastmodified` to the upload time) and exposes no checksums:
-
-- After uploading a local file with an older `mtime`, the remote `ModTime` becomes the upload time (`tr > tl`).
-- On the next run, `plan_sync()` classifies every recently uploaded file as `download_changed` and downloads them back over the local files, clobbering local modification timestamps.
-- `save_state()` ([`webde_sync.py`](webde_sync.py), lines 131–146 and 397–404) stores only a single `(size, modtime)` tuple taken from `loc2`, so it cannot track asymmetric local vs. remote metadata (or remote ETags) across syncs.
+- After a hard crash or reboot, if the old PID recorded in `*.lck` has been reassigned to any unrelated running process (e.g. a system daemon causing `PermissionError`, or any running user process where `os.kill(pid, 0)` succeeds), `webde_sync.py` refuses to run until the user deletes the lock file manually — even though `webde_sync.py` already holds the exclusive `ProfileLock` (which is inherited by child `rclone` processes).
+- **Recommended fix:** On Linux, check `/proc/<pid>/comm` (or `/proc/<pid>/cmdline`) to verify the running PID is actually `rclone` before treating the lock as live.
 
 ---
 
-## 2. Security and Data-Safety Issues
+## 2. Minor Bugs and Edge Cases
 
-- **Path traversal and infinite loop in `delete_local()` ([`webde_sync.py`](webde_sync.py), lines 265–277):**
-  `rel` comes from remote `rclone lsjson` output and is joined directly via `f = local / rel`. An absolute path (e.g. `/etc/passwd`) discards `local` entirely in `pathlib`, and `..` segments escape `local`. If `f` resolves outside `local`, `while d != local and d.is_dir():` climbs to `/` and loops forever (`Path("/").parent == Path("/")`). Paths must be validated to ensure no `..` traversal and that `(local / rel).resolve().is_relative_to(local)`.
-- **Overly broad `rclone rmdirs` ([`webde_sync.py`](webde_sync.py), line 260):**
-  `rclone(["rmdirs", remote])` omits `--leave-root` (allowing the remote sync root itself to be deleted if emptied) and removes *all* empty directories on the remote, including intentionally empty folders and folders whose files were excluded via `--exclude`.
-- **No mass-deletion safeguard:**
-  If a local directory is an unmounted external drive or the remote path is temporarily empty, the script will schedule deleting 100% of the other side's files with no `--max-delete` threshold.
-- **No backup or trash safety net:**
-  Overwrites and local `f.unlink()` deletions are permanent. Supporting `--backup-dir` (or moving deleted/overwritten files to a backup or trash folder) would prevent irreversible data loss.
-- **No concurrency locking:**
-  Two simultaneous runs can race on transfers and deletions and overwrite the same fixed temporary state path (`path.with_suffix(path.suffix + ".tmp")` on line 144).
-- **State file location and permissions ([`webde_sync.py`](webde_sync.py), lines 109–111 and 131–146):**
-  - The default path is `~/.cache/websync/<key>.json`. Per the XDG Base Directory Specification, `~/.cache` is for disposable cache data; clearing it erases deletion history and resurrects previously deleted files. Persistent sync state belongs in `$XDG_STATE_HOME` (`~/.local/state/websync/`).
-  - The state file is written with the process's default umask (typically `0644`), exposing the entire cloud file inventory to other local users on multi-user systems; `0600` (with directory mode `0700`) is safer.
-- **Encrypted `rclone.conf` incompatibility ([`webde_sync.py`](webde_sync.py), line 65):**
-  `rclone()` runs `subprocess.run(cmd, capture_output=True, text=True)`, which can hide interactive password prompts if the user encrypts `rclone.conf` to protect their web.de credentials.
-- **No remote or transport validation:**
-  The script does not verify that `remote` is a configured `rclone` remote or uses `https://`. A typo omitting `:` (e.g. `webde/Backup` instead of `webde:/Backup`) is silently treated by `rclone` as a local path.
+- **No overwrite warning during `--resync` ([`webde_sync.py`](webde_sync.py), lines 1005–1014):**
+  `replaced` counts only entries where `why.startswith("changed")`, whereas `--resync` sets `reason = "resync"`. Differing files overwritten during `--resync` — even when `backups = false` — never trigger the `PERMANENTLY` warning.
+- **Resolved conflicts are double-counted in the preview ([`webde_sync.py`](webde_sync.py), lines 592–603):**
+  With `conflict_resolve = "local"` (or `"remote"`), the winning copy is listed under *both* `upload to server` (or `download to local`) and `conflict`, inflating `rep.n_actions` (e.g. `Apply these 2 change(s)?` for a single file) and counting the conflict as a replacement.
+- **`verify()` usability and flag issues ([`webde_sync.py`](webde_sync.py), lines 791–831):**
+  - Uses `rc.run(...)` (`capture_output=True`), giving **zero progress output** while downloading an entire cloud folder byte-by-byte.
+  - Passes `*profile.rclone_flags` directly to `rclone check`; any bisync-only flag in `rclone_flags` (e.g. `--compare`, `--track-renames`, `--conflict-loser`) causes `--verify` to fail with `unknown flag`.
+  - Truncates file lists at `max_show` without printing `... and N more (use --list-all)` (lines 813–815).
+  - Suggested fix commands (lines 822–824) wrap paths in raw single quotes instead of `shlex.quote(...)`, breaking on filenames containing `'`.
+- **Helper `rclone` calls ignore `rclone_flags` and `extra` ([`webde_sync.py`](webde_sync.py), lines 249, 286, 293, 655, 682, 778, 783):**
+  `config_is_encrypted`, `check_remote_configured`, `remote_dir_exists`, `pending_conflicts`, `show_backups`, and `prune_backups` do not receive `rclone_flags` or `extra`, so options like `-- --config /alt/rclone.conf` or WebDAV `--tpslimit`/`--timeout` are not applied uniformly.
+- **Misleading Ctrl-C message during `--resync` ([`webde_sync.py`](webde_sync.py), lines 1024–1029):**
+  If a `--resync` is interrupted before `"Bisync successful"` is logged, `baseline.json` is not written, so the next run *will* still require `--resync` despite printing `(no --resync needed)`.
 
 ---
 
-## 3. Completeness for Linux ↔ web.de WebDAV
+## 3. Security and web.de-Specific Notes
 
-- **Excessive remote listings ([`webde_sync.py`](webde_sync.py), lines 332–333 and 395–396):**
-  Every active sync calls `listing()` four times (two full recursive scans locally and two remotely), which is slow and increases rate-limiting risk on WebDAV.
-- **No WebDAV tuning or passthrough options:**
-  web.de WebDAV frequently throttles or drops connections under `rclone`'s default concurrency. There is no way to configure `--transfers`, `--tpslimit`, `--retries`, `--timeout`, or extra `rclone` flags.
-- **No saved profiles or `--exclude-from`:**
-  Every invocation requires retyping `LOCAL_DIR`, `REMOTE`, and all `--exclude` patterns. Omitting one `--exclude` flag on a single run can accidentally upload `.git/`, `.venv/`, or temporary files.
-- **Unhandled filesystem features:**
-  Local symlinks are silently ignored by `rclone lsjson` without warning, and empty directories are neither synced nor preserved cleanly.
-- **Missing documentation and version check:**
-  The docstring ([`webde_sync.py`](webde_sync.py), line 33) states `Requires: rclone >= 1.52` and points to a setup README, yet no version check is implemented and no README exists in the repository.
+### What is done well
 
----
+- No `shell=True` anywhere; all subprocesses pass argument lists directly.
+- State, bisync listings, and logs live in `$XDG_STATE_HOME/webde-sync/` (`~/.local/state/webde-sync/`) with directory mode `0700`.
+- Exclusive per-profile `flock` is inherited by child `rclone` processes via `pass_fds`.
+- Encrypted `rclone.conf` is detected automatically, prompts once via `getpass.getpass()`, and sets `RCLONE_ASK_PASSWORD=false` so `rclone` never hangs invisibly.
+- Refuses `/` as the local directory, rejects `--force --yes`, refuses silent `-y` first runs or filter changes, and treats a missing remote folder as an error rather than a mass delete.
 
-## 4. Usability and Code Quality
+### Remaining considerations
 
-- **Zero transfer progress output ([`webde_sync.py`](webde_sync.py), line 65):**
-  Because `capture_output=True` buffers all output until `rclone` exits, multi-gigabyte uploads or downloads over WebDAV appear completely frozen until completion.
-- **Confusing prompts when `n_transfers == 0` ([`webde_sync.py`](webde_sync.py), lines 371–374):**
-  When there are zero transfers but pending deletions or conflicts, the script still prompts `Transfer 0 file(s)? [y/N]`.
-- **Negative `--max-show` accepted ([`webde_sync.py`](webde_sync.py), lines 218–219 and 301–302):**
-  Passing `--max-show -1` slices `paths[:-1]`, displaying all entries except the last instead of rejecting invalid input.
-- **Unnormalized remote key for state path ([`webde_sync.py`](webde_sync.py), line 110):**
-  `webde:`, `webde:/`, and `webde://` hash to different state files even though they point to the same remote directory.
-- **Dead and obfuscated code:**
-  - Unfinished dead code in `main()` ([`webde_sync.py`](webde_sync.py), lines 326–327): `+ (f" (last sync {getattr(state, '')})" if False else "")`.
-  - Obfuscated walrus expression in `plan_sync()` ([`webde_sync.py`](webde_sync.py), lines 172–176): `(p.unchanged.__class__ and (p.unchanged := p.unchanged + 1) if ls == rs else p.conflicts.append(path))`.
-  - Unhandled `KeyboardInterrupt` during `rclone` execution prints a raw Python traceback instead of exiting cleanly.
+- **On-the-fly remotes (`:webdav,...:`):** Allowed by `check_remote_configured()` ([`webde_sync.py`](webde_sync.py), line 281); any inline credentials in such a remote string would be printed to stdout and written to `baseline.json` and logs.
+- **No HTTPS check:** The script verifies that the remote exists, not that a `webdav` remote uses `https://` rather than plaintext `http://`.
+- **Environment password exposure:** `RCLONE_CONFIG_PASS` is placed in the child process environment (`/proc/<pid>/environ`, readable only by the same UID or root on Linux — standard for `rclone`; `RCLONE_PASSWORD_COMMAND` is documented in [`README.md`](README.md) for unattended use).
+- **Live web.de validation & rate limits:** `rclone_flags = ["--tpslimit", "4", "--transfers", "2"]` is commented out in `EXAMPLE_CONFIG` ([`webde_sync.py`](webde_sync.py), line 78). Enabling conservative throttling defaults is worth considering for web.de WebDAV, and running one live smoke test (including a replacement/deletion backup `MOVE`) against `https://webdav.smartdrive.web.de` is advisable before syncing primary folders, since [`tests/test_webde_sync.py`](tests/test_webde_sync.py) tests against local `rclone serve webdav`.
 
 ---
 
-## 5. Recommendations
+## 4. Recommended Fix Checklist
 
-### Option A: Wrap `rclone bisync` (Recommended)
-
-Modern `rclone` (especially `>= 1.66`) includes built-in **`rclone bisync`**, which already implements three-way state tracking, conflict resolution strategies, `--max-delete` safety checks, concurrency locking, `--backup-dir`, progress reporting, and WebDAV options (`--compare size`, `--resync`).
-
-Replacing the custom diff engine with a thin Python wrapper that:
-1. loads a named sync profile (paths, excludes, WebDAV throttling defaults) from a config file,
-2. runs `rclone bisync --dry-run` and renders a concise preview,
-3. prompts for confirmation (with extra confirmation when deletions exceed a threshold), and
-4. executes `rclone bisync` with live progress output
-
-will be significantly smaller, safer, and more reliable for web.de WebDAV.
-
-### Option B: Fix the Standalone Implementation
-
-If you prefer to keep a standalone diff/plan script, apply at least these fixes before syncing real data:
-
-1. Parse `rclone lsjson`'s PascalCase keys (`Path`, `Size`, `ModTime`, `IsDir`).
-2. Store **both** local and remote metadata (plus remote `ETag` if returned) in the state file so `plan_sync()` can perform true three-way diffing (detecting two-way conflicts and handling WebDAV's non-preserved `ModTime`).
-3. Fix the swapped `loc`/`rem` arguments in `show()`, the inverted deletion confirmation logic, and the `Transfer 0 file(s)?` prompt.
-4. Switch from `--files-from` + `--exclude` to `--files-from-raw` (or stdin `-`), reject embedded newlines, and enforce strict path containment in `delete_local()`.
-5. Pass `--leave-root` (or clean up only targeted directories) instead of bare `rclone rmdirs`, add a `--max-delete` limit, add a lockfile, move state to `~/.local/state/websync/` with `0600` permissions (normalizing the remote path), and stream live progress during transfers.
+1. **Fix `>= 1 KiB` dry-run parsing:** Read structured `size` and `skipped` fields from `rclone --use-json-log` in `log_messages()` / `parse_report()`, and add a preview + `--resync --dry-run` test with files `> 1 KiB`.
+2. **Fix `check_access` dry-run side effect:** Create `RCLONE_TEST` only after confirmation (and only when absent on the remote as well).
+3. **Harden `clear_stale_bisync_locks()`:** Check `/proc/<pid>/comm` (or `cmdline`) on Linux so PID reuse cannot wedge future runs.
+4. **Polish `--verify` and preview edge cases:** Stream progress during `verify()`, add the `... and N more` footer, use `shlex.quote(...)` in advice commands, avoid double-counting resolved conflicts, and warn about `--resync` overwrites when `backups = false`.
