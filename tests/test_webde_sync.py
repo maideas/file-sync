@@ -144,6 +144,22 @@ def test_general_flags_drop_bisync_only_flags():
     assert ws.general_flags(flags) == ["--tpslimit", "4", "--config", "/x.conf", "-v"]
 
 
+def test_strip_filter_flags_drops_filters_keeps_the_rest():
+    flags = ["--exclude", "*.log", "--max-age=2y", "--include-from", "/f", "--min-size",
+             "10k", "--tpslimit", "4", "--config", "/x.conf", "-v"]
+    assert ws.strip_filter_flags(flags) == ["--tpslimit", "4", "--config", "/x.conf", "-v"]
+
+
+def test_clear_stale_listings_drops_listings_but_not_locks(tmp_path):
+    st = ws.State(tmp_path)
+    st.workdir.mkdir(parents=True)
+    for name in ("old..pair.path1.lst", "old..pair.path2.lst", "new..pair.path1.lst.new",
+                 "keep.lck"):
+        (st.workdir / name).write_text("x\n")
+    ws.clear_stale_listings(st)
+    assert [p.name for p in st.workdir.iterdir()] == ["keep.lck"]
+
+
 @pytest.mark.parametrize("url, plain", [
     ("http://webdav.example.org", True), ("HTTP://10.0.0.5:8080/dav", True),
     ("https://webdav.smartdrive.web.de", False), ("http://127.0.0.1:18080", False),
@@ -516,6 +532,19 @@ def test_profile_mode_filters_and_resync_on_filter_change(env):
     assert r.returncode == 0 and "RESYNC" in r.stdout and env.remote("junk.tmp").exists()
 
 
+def test_backup_pruning_survives_filter_flags_after_double_dash(env):
+    env.baseline()
+    old = (datetime.now().astimezone() - timedelta(days=40)).strftime(ws.STAMP_FMT)
+    for side in (env.local, env.server / "sync"):
+        env.put(side, f"{ws.BACKUP_DIR}/{old}/x.txt", "old\n")
+    env.put(env.local, "keep0.txt", "changed\n")
+    r = env.sync("--", "--exclude", "*.log")     # for bisync; must not reach purge/lsf
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Backups of" in r.stdout               # the backup listing is not filtered away
+    for side in (env.local, env.server / "sync"):
+        assert not (side / ws.BACKUP_DIR / old).exists()
+
+
 def test_old_backups_are_pruned(env):
     env.baseline()
     old = (datetime.now().astimezone() - timedelta(days=40)).strftime(ws.STAMP_FMT)
@@ -728,6 +757,17 @@ def test_empty_baseline_left_by_older_versions_is_cleared(env):
     assert not (st_root / "baseline.json").exists()
     r = env.sync()
     assert r.returncode == 0 and "RESYNC" in r.stdout, r.stdout + r.stderr
+
+
+def test_resync_clears_stale_listings_of_an_old_path_pair(env):
+    env.baseline()
+    workdir = next((env.tmp / "state" / ws.APP).glob("adhoc-*")) / "bisync"
+    stale = workdir / "old..pair.path1.lst"
+    stale.write_text('-        1 - - 2026-01-01T00:00:00Z "old.txt"\n')
+    r = env.sync("--resync", "-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not stale.exists()                     # leftovers of another pair are gone
+    assert list(workdir.glob("*.path1.lst"))      # the current pair's listing remains
 
 
 def test_special_file_names_sync_and_show_correctly(env):

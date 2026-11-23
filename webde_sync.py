@@ -268,6 +268,29 @@ def general_flags(flags: list[str]) -> list[str]:
     return out
 
 
+# rclone filter flags: users may put them in rclone_flags / after `--` (bisync
+# combines them with the --filters-file rules), but helper calls must not see
+# them -- `purge` rejects filters outright, and they could hide entries from
+# the lsf calls that check backups and emptiness.
+FILTER_VALUE_FLAGS = {"--exclude", "--exclude-from", "--filter", "--filter-from",
+                      "--files-from", "--files-from-raw", "--include", "--include-from",
+                      "--min-size", "--max-size", "--min-age", "--max-age"}
+
+
+def strip_filter_flags(flags: list[str]) -> list[str]:
+    """Drop rclone filter flags (and their values) from a user flag list."""
+    out, skip_value = [], False
+    for f in flags:
+        if skip_value:
+            skip_value = False
+            continue
+        if f.split("=", 1)[0] in FILTER_VALUE_FLAGS:
+            skip_value = "=" not in f
+        else:
+            out.append(f)
+    return out
+
+
 def find_rclone(explicit: str | None) -> Rclone:
     binary = explicit or os.environ.get("WEBDE_SYNC_RCLONE") or "rclone"
     path = shutil.which(binary)
@@ -478,6 +501,17 @@ def write_if_changed(path: Path, text: str) -> None:
         os.replace(tmp, path)
 
 
+def clear_stale_listings(st: State) -> None:
+    """Drop bisync's listing files before a confirmed --resync rebuilds them --
+    including leftovers of an older path pair (local/remote changed in the
+    profile), which the *.path1.lst globs below would otherwise still see."""
+    for lst in st.workdir.glob("*.lst*"):
+        try:
+            lst.unlink()
+        except OSError:
+            pass
+
+
 def baseline_problem(profile: Profile, st: State, filters_text: str) -> str | None:
     """Why a --resync is needed, or None if the last resync is still valid."""
     try:
@@ -509,7 +543,8 @@ def listing_is_empty(st: State) -> bool:
 
 def local_has_files(rc: Rclone, profile: Profile, st: State) -> bool:
     proc = rc.run(["lsf", "-R", "--files-only", "--filter-from", str(st.filters),
-                   str(profile.local)], check=False)
+                   *strip_filter_flags(rc.flags), str(profile.local)],
+                  check=False, add_flags=False)
     return proc.returncode != 0 or bool(proc.stdout.strip())
 
 
@@ -843,7 +878,8 @@ def show_backups(rc: Rclone, profile: Profile, stamp: str, max_show: int | None)
     found = []
     for side, root in (("local ", str(profile.local)), ("server", profile.remote)):
         bdir = remote_join(root, f"{BACKUP_DIR}/{stamp}")
-        proc = rc.run(["lsf", "-R", "--files-only", bdir], check=False)
+        proc = rc.run(["lsf", "-R", "--files-only", *strip_filter_flags(rc.flags),
+                       bdir], check=False, add_flags=False)
         files = sorted(proc.stdout.splitlines()) if proc.returncode == 0 else []
         if files:
             found.append((side, tilde(bdir) + "/", files))
@@ -968,12 +1004,14 @@ def prune_backups(rc: Rclone, profile: Profile, now: datetime) -> None:
     cutoff = now - timedelta(days=profile.keep_backups_days)
     for root in (str(profile.local), profile.remote):
         bdir = remote_join(root, BACKUP_DIR)
-        proc = rc.run(["lsf", "--dirs-only", "--max-depth", "1", bdir], check=False)
+        proc = rc.run(["lsf", "--dirs-only", "--max-depth", "1",
+                       *strip_filter_flags(rc.flags), bdir], check=False, add_flags=False)
         for name in proc.stdout.splitlines() if proc.returncode == 0 else []:
             name = name.rstrip("/")
             try:
                 if datetime.strptime(name, STAMP_FMT).astimezone() < cutoff:
-                    rc.run(["purge", remote_join(bdir, name)])
+                    rc.run(["purge", *strip_filter_flags(rc.flags), remote_join(bdir, name)],
+                           add_flags=False)
                     info(f"pruned old backup {remote_join(bdir, name)}")
             except ValueError:
                 continue                # not one of ours, leave it alone
@@ -988,6 +1026,7 @@ def verify(rc: Rclone, profile: Profile, st: State, assume_yes: bool,
     if not assume_yes and not confirm("Start the full content check?"):
         return EXIT_ABORTED
     result = st.root / "verify.txt"          # inside the private state directory
+    result.unlink(missing_ok=True)           # a hard-killed earlier run may have left one
     cmd = rc.cmd(["check", str(profile.local), profile.remote, "--download",
                   "--filter-from", str(st.filters), "--combined", str(result),
                   "--color", "NEVER", *rc.flags])
@@ -1287,6 +1326,7 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
             return answer
     if resync:
         ensure_check_file(rc, profile)
+        clear_stale_listings(st)             # --resync rebuilds the listings anyway
 
     info("Syncing ...")
     rep = execute(rc, bisync_args(profile, st, dry_run=False, **common), profile, st, stamp)

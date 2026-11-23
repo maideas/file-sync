@@ -273,5 +273,7 @@ rclone flags via `--`, http warnings, changes between preview and sync,
 safety aborts, `--verify`, profiles, backup pruning, locking,
 Ctrl-C (also during a resync), and an encrypted rclone config.
 
-[webde-sync-code-review.md](webde-sync-code-review.md) is the review of the
-previous, self-written sync engine that this version replaces.
+[webde-sync-code-review.md](webde-sync-code-review.md) reviews this script
+for security, completeness, and ease of use; reviews of the earlier,
+self-written sync engine and of the first `rclone bisync` rewrite are
+preserved in git history.
