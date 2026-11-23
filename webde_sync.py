@@ -38,6 +38,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -170,6 +171,12 @@ def _choice(value: str, choices: tuple[str, ...], key: str, where: str) -> str:
     return value
 
 
+def normalize_remote(remote: str) -> str:
+    """webde:Docs/ and webde:Docs are the same folder (keep webde: and webde:/)."""
+    stripped = remote.rstrip("/")
+    return remote if stripped.endswith(":") or not stripped else stripped
+
+
 def profile_from_dict(name: str | None, raw: dict, where: str) -> Profile:
     for key, value in raw.items():
         if key not in PROFILE_KEYS:
@@ -182,7 +189,8 @@ def profile_from_dict(name: str | None, raw: dict, where: str) -> Profile:
     for key in ("local", "remote"):
         if not raw.get(key):
             raise UsageError(f"{where}: '{key}' is required")
-    p = Profile(name=name, local=Path(raw["local"]).expanduser(), remote=raw["remote"])
+    p = Profile(name=name, local=Path(raw["local"]).expanduser(),
+                remote=normalize_remote(raw["remote"]))
     p.filters = list(raw.get("filters", []))
     if raw.get("filters_file"):
         p.filters_file = Path(raw["filters_file"]).expanduser()
@@ -487,6 +495,29 @@ def baseline_problem(profile: Profile, st: State, filters_text: str) -> str | No
     return None
 
 
+def listing_is_empty(st: State) -> bool:
+    """True if bisync's local listing (written by the last run) holds no files."""
+    for lst in st.workdir.glob("*.path1.lst"):
+        try:
+            lines = lst.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        if any(line.strip() and not line.startswith("#") for line in lines):
+            return False
+    return True
+
+
+def local_has_files(rc: Rclone, profile: Profile, st: State) -> bool:
+    proc = rc.run(["lsf", "-R", "--files-only", "--filter-from", str(st.filters),
+                   str(profile.local)], check=False)
+    return proc.returncode != 0 or bool(proc.stdout.strip())
+
+
+NOTHING_YET = ("Nothing to sync yet (both sides are empty, or the filters exclude every "
+               "file),\nso no baseline was created. Add files on either side and run "
+               "again; that run does the first sync.")
+
+
 def write_baseline(profile: Profile, st: State, filters_text: str, ver: tuple) -> None:
     data = {"local": str(profile.local), "remote": profile.remote,
             "filters_sha256": hashlib.sha256(filters_text.encode()).hexdigest(),
@@ -503,7 +534,11 @@ def bisync_args(profile: Profile, st: State, *, resync: bool, dry_run: bool, for
          "--workdir", str(st.workdir), "--filters-file", str(st.filters),
          "--resilient", "--recover", "--max-lock", LOCK_EXPIRY,
          "--max-delete", str(profile.max_delete),
-         "--conflict-resolve", profile.conflict_resolve, "--color", "NEVER"]
+         "--conflict-resolve", profile.conflict_resolve, "--color", "NEVER",
+         # one attempt per run: with --ignore-times a retry re-sends *every* queued
+         # file; the next run retries anyway (--resilient), single requests are still
+         # retried (--low-level-retries). rclone_flags can override this.
+         "--retries", "1"]
     if resync:
         a += ["--resync-mode", profile.resync_mode]
     else:
@@ -537,6 +572,7 @@ RE_RESYNC_DIR = re.compile(r"^- (Path[12])\s+Resync is copying files to\s+- (Pat
 RE_COPIED = re.compile(r"^(.+): Copied \((?:new|replaced existing)\)")
 RE_SYMLINK = re.compile(r"^(.+): Can't follow symlink")
 RE_CONFLICT_COPY = re.compile(r"^(.+)\.conflict\d+$")
+RE_FAILED = re.compile(r"^.+?: Failed to [a-z ]+: (.+)$")
 RE_SUMMARY = re.compile(r"^Path[12]:\s+(\d+) changes:")
 RE_STATS_COUNT = re.compile(r"^Transferred:\s+(\d+) / \d+,", re.MULTILINE)   # file count, not bytes
 IGNORED_WARNINGS = ("bisync is IN BETA", "Modtime compare was requested")
@@ -566,6 +602,8 @@ class Report:
     lock_error: bool = False
     safety_abort: bool = False
     empty_side: bool = False
+    empty_baseline: bool = False  # bisync cannot continue from an empty prior listing
+    failed: dict[str, str] = field(default_factory=dict)   # path -> reason
     interrupted: bool = False
 
     @property
@@ -574,12 +612,26 @@ class Report:
                 + len(self.delete_local) + len(self.conflicts))
 
 
+def unquote(path: str) -> str:
+    """bisync prints names containing quotes or backslashes Go-quoted ("a\\"b")."""
+    if len(path) >= 2 and path[0] == path[-1] == '"':
+        try:
+            return json.loads(path)
+        except ValueError:
+            try:
+                return ast.literal_eval(path)
+            except (ValueError, SyntaxError):
+                pass
+    return path
+
+
 def _relativizer(local: Path, remote: str):
     prefixes = {"Path1": [str(local).rstrip("/") + "/"],
                 "Path2": sorted({remote if remote.endswith((":", "/")) else remote + "/",
                                  remote + "/", remote.rstrip("/") + "/"}, key=len, reverse=True)}
 
     def rel(side: str, path: str) -> str:
+        path = unquote(path)
         for pre in prefixes[side]:
             if path.startswith(pre):
                 return path[len(pre):]
@@ -633,7 +685,7 @@ def parse_report(messages: list[Msg], local: Path, remote: str) -> Report:
                 rep.replaced.add(entry.obj)
         elif m := RE_DETECT.match(text):
             kind = m[2]
-            detect[(m[1], m[3])] = ("new" if kind == "File is new" else
+            detect[(m[1], unquote(m[3]))] = ("new" if kind == "File is new" else
                                     "deleted" if kind == "File was deleted" else
                                     kind.replace("File ", "", 1))
         elif m := RE_QCOPY.match(text):
@@ -641,7 +693,7 @@ def parse_report(messages: list[Msg], local: Path, remote: str) -> Report:
         elif m := RE_QDEL.match(text):
             (rep.delete_remote if m[1] == "Path2" else rep.delete_local).append(rel(m[1], m[2]))
         elif m := RE_BOTH.match(text):
-            both.add(m[1])
+            both.add(unquote(m[1]))
         elif m := RE_RESYNC_DIR.match(text):
             resync_target = m[2]
         elif (m := RE_COPIED.match(text)) and resync_target:
@@ -664,12 +716,17 @@ def parse_report(messages: list[Msg], local: Path, remote: str) -> Report:
             rep.safety_abort = True
         if "Empty current Path" in text:
             rep.empty_side = True
+        if "Empty prior Path" in text:
+            rep.empty_baseline = True
         if "Transferred:" in msg and "Elapsed time" in msg:
             rep.stats = msg.strip("\n")
             if m := RE_STATS_COUNT.search(rep.stats):
                 rep.stats_transfers = int(m[1])
         if level in ("error", "critical", "raw") or text.startswith("Failed to bisync"):
-            rep.errors.append(text)
+            if text not in rep.errors:            # rclone repeats them per retry
+                rep.errors.append(text)
+            if entry.obj and (m := RE_FAILED.match(text)):
+                rep.failed.setdefault(entry.obj, m[1].rsplit(": ", 1)[-1])
         elif level in ("warning", "notice") and "WARNING" in text and not RE_BOTH.match(text) \
                 and not any(w in text for w in IGNORED_WARNINGS):
             rep.warnings.append(text)
@@ -802,11 +859,25 @@ def show_backups(rc: Rclone, profile: Profile, stamp: str, max_show: int | None)
             info(f"      ... and {len(files) - limit} more (use --list-all)")
 
 
-def advise(rep: Report, profile: Profile, st: State) -> None:
+def advise(rep: Report, profile: Profile, st: State, resync: bool = False) -> None:
     """Explain failed runs in terms of what the user can do next."""
     for e in rep.errors:
         print(f"rclone: {e}", file=sys.stderr)
     name = profile.name or f"{tilde(profile.local)} {profile.remote}"
+    if rep.failed:
+        print("\nThese files could not be transferred:", file=sys.stderr)
+        for path, why in sorted(rep.failed.items()):
+            print(f"    {path}  ({why})", file=sys.stderr)
+        print("  Fix the cause (permissions, a file in use, ...) or exclude the files with "
+              "a filter rule.", file=sys.stderr)
+    text = " ".join(rep.errors).lower()
+    if "not a directory" in text or "is a directory" in text:
+        print("\nA file on one side has the same name as a folder on the other side. "
+              "Rename one of them.", file=sys.stderr)
+    if "insufficient storage" in text or " 507" in text or "quota" in text:
+        print("\nThe web.de storage seems to be full: free space there (old backups are in "
+              f"{remote_join(profile.remote, BACKUP_DIR)}/) or upgrade the plan.",
+              file=sys.stderr)
     if rep.safety_abort:
         print(f"\nbisync's safety check stopped the sync (more than {profile.max_delete}% "
               "deletions or all files changed). If that is really intended, review it with:\n"
@@ -820,10 +891,21 @@ def advise(rep: Report, profile: Profile, st: State) -> None:
     if rep.lock_error:
         print("\nAnother `rclone bisync` (not started by webde_sync) uses this profile's "
               f"state in {tilde(st.workdir)}. Let it finish and try again.", file=sys.stderr)
-    if rep.needs_resync:
+    if rep.empty_baseline:
         st.baseline.unlink(missing_ok=True)
-        print(f"\nbisync lost its baseline. The next run of `webde_sync.py {name}` will "
-              "preview a resync (nothing gets deleted).", file=sys.stderr)
+        print(f"\nThe baseline was made while both sides were empty, and bisync cannot "
+              f"continue from that\n(despite its message, retrying does not help). The next "
+              f"run of `webde_sync.py {name}` previews a\nfresh first sync instead.",
+              file=sys.stderr)
+    if rep.needs_resync and resync:
+        print(f"\nThe first sync (resync) did not complete. Fix the cause above and run "
+              f"`webde_sync.py {name}` again.", file=sys.stderr)
+    elif rep.needs_resync:
+        st.baseline.unlink(missing_ok=True)
+        print("\nAfter this error bisync needs a fresh first sync (resync). Fix the cause "
+              f"above, then run\n`webde_sync.py {name}` interactively: it previews the "
+              "resync (nothing gets deleted).\nUnattended -y runs stop until then.",
+              file=sys.stderr)
 
 
 # --------------------------------------------------------------------- actions
@@ -1117,6 +1199,23 @@ def report_surprises(plan: Report, done: Report, max_show: int | None) -> None:
     print("\n".join(lines), file=sys.stderr, flush=True)
 
 
+def unique_stamp(st: State) -> tuple[datetime, str]:
+    """Time stamp for this run's backup folder, never the same as the last run's
+    (two runs within one second would otherwise share -- and overwrite -- it)."""
+    last_file = st.root / "last-stamp"
+    try:
+        last = last_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        last = ""
+    while True:
+        now = datetime.now().astimezone()
+        stamp = now.strftime(STAMP_FMT)
+        if stamp != last:
+            write_if_changed(last_file, stamp + "\n")
+            return now, stamp
+        time.sleep(0.2)
+
+
 def ensure_check_file(rc: Rclone, profile: Profile) -> None:
     """Create the check_access marker for a confirmed resync, unless a side has one."""
     marker = profile.local / "RCLONE_TEST"
@@ -1165,8 +1264,7 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
             return EXIT_ABORTED
         rc.run(["mkdir", profile.remote])
 
-    now = datetime.now().astimezone()
-    stamp = now.strftime(STAMP_FMT)
+    now, stamp = unique_stamp(st)
     common = {"resync": resync, "force": args.force, "stamp": stamp, "extra": extra}
     plan = None
     if not args.yes or args.dry_run:
@@ -1177,10 +1275,13 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
         info()
         remind_conflicts(profile, st, max_show)
         if plan.errors:
-            advise(plan, profile, st)
+            advise(plan, profile, st, resync)
             return EXIT_FAIL
         if args.dry_run:
             info("--dry-run: nothing was changed.")
+            return EXIT_OK
+        if resync and plan.n_actions == 0 and not local_has_files(rc, profile, st):
+            info(NOTHING_YET)       # (nothing planned + nothing local = server empty too)
             return EXIT_OK
         if (answer := review(plan, profile, resync, stamp)) is not None:
             return answer
@@ -1193,6 +1294,11 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
     if rep.stats:
         info(rep.stats)
     if rep.success and resync:
+        if listing_is_empty(st):    # bisync could not continue from an empty baseline
+            st.baseline.unlink(missing_ok=True)
+            info(NOTHING_YET)
+            info(f"log: {tilde(st.logs / (stamp + '.log'))}")
+            return EXIT_OK
         write_baseline(profile, st, filters_text, rc.version())
     log_note = f"log: {tilde(st.logs / (stamp + '.log'))}"
     if rep.interrupted:            # the queued lists are plans, not completed transfers
@@ -1206,7 +1312,7 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
         info(log_note)
         return 130
     if not rep.success:
-        advise(rep, profile, st)
+        advise(rep, profile, st, resync)
         show_backups(rc, profile, stamp, max_show)
         info(f"\n{log_note}")
         return EXIT_FAIL

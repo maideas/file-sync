@@ -187,6 +187,45 @@ def test_pending_conflicts_come_from_bisync_listing(tmp_path):
     assert ws.pending_conflicts(p, st) == ["d/a.txt.conflict1", 'q"x.conflict2']
 
 
+def test_parse_quoted_names_and_failed_files():
+    rep = parse([
+        jl('- Path1    File is new               - "quo\\"te.txt"'),
+        jl('- Path1    Queue copy to Path2       - "webde:sync/quo\\"te.txt"'),
+        jl('- Path1    Queue copy to Path2       - "webde:sync/back\\\\slash.txt"'),
+        skipped("copy", 'quo"te.txt', 9),
+        jl("Failed to copy: failed to open source object: open /l/s.txt: permission denied",
+           "error", obj="s.txt"),
+        jl("Failed to copy: failed to open source object: open /l/s.txt: permission denied",
+           "error", obj="s.txt"),
+    ])
+    assert rep.upload == {'quo"te.txt': "new", "back\\slash.txt": "changed"}
+    assert rep.sizes == {'quo"te.txt': 9}
+    assert rep.failed == {"s.txt": "permission denied"} and len(rep.errors) == 1
+
+
+@pytest.mark.parametrize("given, expected", [
+    ("webde:Docs/", "webde:Docs"), ("webde:/Docs//", "webde:/Docs"), ("webde:/", "webde:/"),
+    ("webde:", "webde:"), ("webde:Docs", "webde:Docs")])
+def test_remote_trailing_slashes_are_normalized(given, expected):
+    assert ws.profile_from_dict(None, {"local": "/x", "remote": given}, "t").remote == expected
+
+
+def test_backup_stamp_differs_from_last_run(tmp_path, monkeypatch):
+    st = ws.State(tmp_path)
+    times = iter([ws.datetime(2026, 1, 1, 12, 0, 0, 100), ws.datetime(2026, 1, 1, 12, 0, 0, 900),
+                  ws.datetime(2026, 1, 1, 12, 0, 1, 50)])
+
+    class FakeDatetime(ws.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(times)
+    monkeypatch.setattr(ws, "datetime", FakeDatetime)
+    monkeypatch.setattr(ws.time, "sleep", lambda s: None)
+    (tmp_path / "last-stamp").write_text("2026-01-01_120000\n")
+    assert ws.unique_stamp(st)[1] == "2026-01-01_120001"
+    assert (tmp_path / "last-stamp").read_text().strip() == "2026-01-01_120001"
+
+
 def test_relativizer_handles_remote_root_forms():
     for remote, shown in (("webde:", "webde:/x/y"), ("webde:/", "webde:/x/y"),
                           ("webde:/Docs/", "webde:/Docs/x/y"), ("webde:Docs", "webde:Docs/x/y")):
@@ -661,3 +700,120 @@ def test_ctrl_c_during_resync_says_it_will_repeat(env):
     r = env.sync(answers="y\n")
     assert r.returncode == 0, r.stdout + r.stderr
     assert env.remote("big2.bin").read_bytes() == (env.local / "big2.bin").read_bytes()
+
+
+def test_first_run_with_both_sides_empty_creates_no_dead_baseline(env):
+    r = env.sync()                                       # interactive: no question asked
+    assert r.returncode == 0 and "Nothing to sync yet" in r.stdout and "[y/N]" not in r.stdout
+    r = env.sync("--resync", "-y")                       # unattended: same outcome
+    assert r.returncode == 0 and "Nothing to sync yet" in r.stdout
+    env.put(env.local, "first.txt", "1\n")
+    r = env.sync()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "RESYNC" in r.stdout and env.remote("first.txt").exists()
+    env.put(env.local, "second.txt", "2\n")
+    r = env.sync("-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert env.remote("second.txt").exists()
+
+
+def test_empty_baseline_left_by_older_versions_is_cleared(env):
+    env.baseline()
+    st_root = next((env.tmp / "state" / ws.APP).glob("adhoc-*"))
+    for lst in (st_root / "bisync").glob("*.path1.lst"):  # what an empty resync leaves
+        lst.write_text("# bisync listing v1 from 2026-01-01\n")
+    assert (st_root / "baseline.json").exists()
+    r = env.sync("-y")
+    assert r.returncode == 1 and "fresh first sync" in r.stderr
+    assert not (st_root / "baseline.json").exists()
+    r = env.sync()
+    assert r.returncode == 0 and "RESYNC" in r.stdout, r.stdout + r.stderr
+
+
+def test_special_file_names_sync_and_show_correctly(env):
+    env.baseline()
+    names = ["with space.txt", 'quo"te.txt', "hash#1.txt", "pct%20.txt", "ümläut ß.txt",
+             " lead.txt", "dash - x.txt", "back\\slash.txt", "new\nline.txt"]
+    for n in names:
+        env.put(env.local, n, n + "\n")
+    r = env.sync()
+    assert r.returncode == 0, r.stdout + r.stderr
+    for n in ('quo"te.txt', "back\\slash.txt", "ümläut ß.txt", " lead.txt"):
+        assert f"      {n}   [new, " in r.stdout, n
+    assert "webde:sync/" not in r.stdout.split("Apply")[0]      # no raw quoted paths
+    for n in names:
+        assert env.remote(n).read_text() == n + "\n", n
+    assert "Everything is in sync." in env.sync().stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read everything")
+def test_unreadable_file_is_named_and_not_retried(env):
+    env.baseline()
+    env.put(env.local, "ok.txt", "ok\n")
+    env.put(env.local, "secret.txt", "s\n")
+    (env.local / "secret.txt").chmod(0)
+    try:
+        r = env.sync("-y")
+        assert r.returncode == 1
+        assert "These files could not be transferred" in r.stderr
+        assert r.stderr.count("secret.txt  (permission denied)") == 1
+        assert "fresh first sync (resync)" in r.stderr
+        assert not (env.server / "sync" / ws.BACKUP_DIR).exists()   # no re-upload by retries
+        assert "resync is needed" in env.sync("-y").stderr          # cron stops ...
+    finally:
+        (env.local / "secret.txt").chmod(0o644)
+    r = env.sync(answers="y\n")                                     # ... until fixed + resync
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert env.remote("secret.txt").exists() and env.remote("ok.txt").exists()
+
+
+def test_file_folder_name_clash_gets_a_hint(env):
+    for i in range(5):
+        env.put(env.local, f"keep{i}.txt", "k\n")
+    env.put(env.local, "x", "file\n")
+    env.put(env.server, "sync/x/inner.txt", "dir\n")
+    r = env.sync(answers="y\n")
+    assert r.returncode == 1 and "same name as a folder" in r.stderr
+    assert "first sync (resync) did not complete" in r.stderr
+    (env.local / "x").rename(env.local / "x.txt")
+    r = env.sync(answers="y\n")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (env.local / "x" / "inner.txt").exists() and env.remote("x.txt").exists()
+
+
+def test_whole_drive_as_remote(env):
+    for i in range(5):
+        env.put(env.local, f"k{i}.txt", f"{i}\n")
+    assert env.run(str(env.local), "webde:", "--resync", "-y").returncode == 0
+    time.sleep(1.1)
+    env.put(env.local, "k0.txt", "changed!\n")
+    r = env.run(str(env.local), "webde:", "-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (env.server / ws.BACKUP_DIR).is_dir() and (env.server / "k0.txt").read_text() == "changed!\n"
+
+
+def test_trailing_slash_uses_the_same_baseline(env):
+    env.baseline()
+    r = env.run(str(env.local), "webde:sync/", "-n")
+    assert r.returncode == 0 and "RESYNC" not in r.stdout and "no changes" in r.stdout
+
+
+def test_baseline_survives_rclone_upgrade(env):
+    old, new = (str(Path(SERVER).with_name(n)) for n in ("rclone-v1.66.0", "rclone-v1.76.0"))
+    if not (Path(old).is_file() and Path(new).is_file()):
+        pytest.skip("needs rclone v1.66.0 and v1.76.0 in build/rclone")
+    env.env["WEBDE_SYNC_RCLONE"] = old
+    env.baseline()
+    env.env["WEBDE_SYNC_RCLONE"] = new
+    env.put(env.local, "after-upgrade.txt", "u\n")
+    r = env.sync("-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert env.remote("after-upgrade.txt").exists()
+
+
+def test_local_empty_first_run_downloads_everything(env):
+    env.put(env.server, "sync/a.txt", "a\n")
+    env.put(env.server, "sync/d/b.txt", "b\n")
+    r = env.sync()
+    assert r.returncode == 0 and "download to local:" in r.stdout, r.stdout + r.stderr
+    assert (env.local / "d" / "b.txt").read_text() == "b\n"

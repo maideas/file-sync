@@ -114,6 +114,12 @@ file exists on both sides with different sizes, the `resync_mode` side wins
 folder is created after asking. `-y` refuses to do a first run unless
 `--resync` is given explicitly.
 
+With an empty (or new) remote folder, the first run simply uploads every
+local file; the preview lists them all with their sizes. If *both* sides are
+empty, nothing is synced and no baseline is created (bisync could not
+continue from an empty one); the first run that finds files does the first
+sync.
+
 ### Overview
 
 ```text
@@ -224,6 +230,16 @@ server they count against the web.de quota until they are pruned after
   the current state (its safety checks still apply). The script lists such
   extra actions after the run.
 - `--verify` downloads everything; it shows rclone's progress meanwhile.
+- A file that cannot be read (permissions) or a file on one side with the
+  same name as a folder on the other makes bisync stop with a critical
+  error. The script names the files and the cause; after fixing it, one
+  interactive run (a resync) is needed. Unattended `-y` runs stop until then.
+- Each run makes one transfer attempt (`--retries 1`): with `--ignore-times`
+  a retry would re-send every queued file. Failed files are retried by the
+  next run; single network requests are still retried by rclone.
+- Not verified against the real web.de server: case-insensitive name
+  collisions (`a.txt` vs `A.txt`), characters web.de rejects, and the
+  error on a full quota (the script recognises HTTP 507 / "quota").
 
 ## Files
 
@@ -251,6 +267,8 @@ times. The server is always rclone v1.66.0 (`WEBDE_SYNC_TEST_SERVER`), because
 into a new folder. That is a bug in the test server only, not in bisync. The tests cover the first run, two-way changes, same-size edits,
 conflicts (kept and resolved), conflict reminders, backup layout and listing,
 previews of files >= 1 KiB, overwrite warnings without backups, `check_access`,
+special file names, unreadable files, file/folder name clashes, the whole drive
+as remote, rclone upgrades, empty sides,
 rclone flags via `--`, http warnings, changes between preview and sync,
 safety aborts, `--verify`, profiles, backup pruning, locking,
 Ctrl-C (also during a resync), and an encrypted rclone config.
