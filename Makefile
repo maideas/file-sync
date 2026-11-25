@@ -1,4 +1,4 @@
-# webde_sync.py -- tests and checks
+# filesync.py -- tests and checks
 #
 #   make test          unit + integration tests against every rclone in RCLONE_VERSIONS
 #   make lint          ruff
@@ -18,12 +18,12 @@ WITH_ENV   := $(if $(SHARED_ENV),. $(SHARED_ENV) &&,)
 .PHONY: test lint fetch-rclone clean
 
 test: $(RCLONE_BINS)
-	WEBDE_SYNC_TEST_RCLONE="$(abspath $(RCLONE_BINS))" \
-	WEBDE_SYNC_TEST_SERVER="$(abspath $(firstword $(RCLONE_BINS)))" PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+	FILESYNC_TEST_RCLONE="$(abspath $(RCLONE_BINS))" \
+	FILESYNC_TEST_SERVER="$(abspath $(firstword $(RCLONE_BINS)))" PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 	  $(PYTHON) -m pytest -q tests
 
 lint:
-	$(WITH_ENV) ruff check --line-length 100 --target-version py311 webde_sync.py tests
+	$(WITH_ENV) ruff check --line-length 100 --target-version py311 filesync.py tests
 
 fetch-rclone: $(RCLONE_BINS)
 

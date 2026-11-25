@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Safe two-way sync between a local folder and the web.de Online-Speicher
-(or any other rclone remote), built on `rclone bisync`.
+"""Safe two-way sync between a local folder and any rclone remote
+(web.de Online-Speicher, Nextcloud, Google Drive, S3, an SFTP server, ...),
+built on `rclone bisync`.
 
 All synchronisation logic -- change detection against the previous run,
 conflict handling, safety aborts, locking, backups, crash recovery -- is done
@@ -10,14 +11,15 @@ by rclone itself.  This wrapper only adds what bisync lacks for everyday use:
   * a preview of the planned changes (bisync --dry-run) and a confirmation,
   * safe defaults: backups of overwritten/deleted files, --max-delete guard,
     keep-both conflict handling, --resilient/--recover, a per-profile lock,
-  * a fix for WebDAV servers without settable modification times such as
-    web.de (--ignore-times, otherwise same-size edits are silently skipped),
+  * support for remotes that cannot store modification times, such as the
+    web.de WebDAV server (--ignore-times, otherwise same-size edits are
+    silently skipped) -- auto-detected from the remote, settable per profile,
   * a guided first run (--resync), a content check (--verify), readable logs.
 
 Usage:
-    webde_sync.py [options] PROFILE             # profile from profiles.toml
-    webde_sync.py [options] LOCAL_DIR REMOTE    # ad-hoc, e.g. ~/Docs webde:/Docs
-    webde_sync.py --list | --example-config
+    filesync.py [options] PROFILE             # profile from profiles.toml
+    filesync.py [options] LOCAL_DIR REMOTE    # ad-hoc, e.g. ~/Docs cloud:/Docs
+    filesync.py --list | --example-config
 
 Arguments after `--` are passed to `rclone bisync` / `rclone check` unchanged
 (e.g. `-- --tpslimit 4`), except for the flags this wrapper controls itself
@@ -46,9 +48,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP = "webde-sync"
+APP = "file-sync"
 MIN_RCLONE = (1, 66, 0)
-BACKUP_DIR = ".webde-sync-backup"
+BACKUP_DIR = ".file-sync-backup"
 STAMP_FMT = "%Y-%m-%d_%H%M%S"
 LOCK_EXPIRY = "5m"       # bisync --max-lock (stale locks of our own runs are removed)
 KEEP_LOGS = 30
@@ -56,12 +58,12 @@ KEEP_LOGS = 30
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_ABORTED = 0, 1, 2, 3
 
 EXAMPLE_CONFIG = """\
-# webde_sync.py profiles -- one [section] per folder pair.
-# Run a profile with:  webde_sync.py docs
+# filesync.py profiles -- one [section] per folder pair.
+# Run a profile with:  filesync.py docs
 
 [docs]
 local  = "~/Documents"
-remote = "webde:/Documents"       # rclone remote, see `rclone listremotes`
+remote = "cloud:/Documents"      # any rclone remote, see `rclone listremotes`
 
 # rclone filter rules, first match wins: https://rclone.org/filtering/
 # Changing them requires one `--resync` run afterwards (bisync's rule).
@@ -71,15 +73,19 @@ filters = [
   "- *.tmp",
   "- ~$*",
 ]
-# filters_file = "~/.config/webde-sync/docs.filters"   # appended to `filters`
+# filters_file = "~/.config/file-sync/docs.filters"   # appended to `filters`
 
 # max_delete        = 50      # abort if more than this % of files would be deleted
-# backups           = true    # keep replaced/deleted files in .webde-sync-backup/<time>/
+# backups           = true    # keep replaced/deleted files in .file-sync-backup/<time>/
 # keep_backups_days = 30      # prune older backups after a successful run; 0 = keep all
 # check_access      = false   # require an RCLONE_TEST file on both sides (mount guard)
 # sync_empty_dirs   = false   # also create/delete empty directories
 # conflict_resolve  = "none"  # none = keep both copies; or local, remote, larger, ...
 # resync_mode       = "local" # winner for differing files in --resync: local, remote, ...
+# ignore_times      = false   # force transfers of same-size files.  Default: auto -- on
+#                             # for remotes that cannot store file times (web.de WebDAV)
+# verify_download   = false   # --verify downloads every file.  Default: auto -- on for
+#                             # remotes that offer no checksums
 # rclone_flags      = ["--tpslimit", "4", "--transfers", "2"]
 """
 
@@ -116,6 +122,7 @@ PROFILE_KEYS: dict[str, type] = {
     "max_delete": int, "backups": bool, "keep_backups_days": int,
     "check_access": bool, "sync_empty_dirs": bool, "conflict_resolve": str,
     "resync_mode": str, "rclone_flags": list,
+    "ignore_times": bool, "verify_download": bool,
 }
 
 
@@ -134,6 +141,11 @@ class Profile:
     conflict_resolve: str = "none"
     resync_mode: str = "path1"
     rclone_flags: list[str] = field(default_factory=list)
+    # None = auto-detect in run(), from what the remote supports: remotes that
+    # cannot store file times need ignore_times, remotes without checksums
+    # need --download for --verify.
+    ignore_times: bool | None = None
+    verify_download: bool | None = None
 
     @property
     def label(self) -> str:
@@ -141,8 +153,8 @@ class Profile:
 
 
 def default_config_path() -> Path:
-    if os.environ.get("WEBDE_SYNC_CONFIG"):
-        return Path(os.environ["WEBDE_SYNC_CONFIG"]).expanduser()
+    if os.environ.get("FILESYNC_CONFIG"):
+        return Path(os.environ["FILESYNC_CONFIG"]).expanduser()
     base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
     return Path(base) / APP / "profiles.toml"
 
@@ -174,7 +186,7 @@ def _choice(value: str, choices: tuple[str, ...], key: str, where: str) -> str:
 
 
 def normalize_remote(remote: str) -> str:
-    """webde:Docs/ and webde:Docs are the same folder (keep webde: and webde:/)."""
+    """cloud:Docs/ and cloud:Docs are the same folder (keep cloud: and cloud:/)."""
     stripped = remote.rstrip("/")
     return remote if stripped.endswith(":") or not stripped else stripped
 
@@ -217,7 +229,17 @@ def profile_from_dict(name: str | None, raw: dict, where: str) -> Profile:
                                  "conflict_resolve", where)
     p.resync_mode = _choice(raw.get("resync_mode", "path1"), RESYNC_MODES, "resync_mode", where)
     p.rclone_flags = list(raw.get("rclone_flags", []))
+    p.ignore_times = raw.get("ignore_times", p.ignore_times)
+    p.verify_download = raw.get("verify_download", p.verify_download)
     return p
+
+
+def resolve_remote_options(profile: Profile, feat: Features) -> None:
+    """Fill the profile's auto ('None') options from the remote's capabilities."""
+    if profile.ignore_times is None:
+        profile.ignore_times = not feat.mtime
+    if profile.verify_download is None:
+        profile.verify_download = not feat.hashes
 
 
 # ----------------------------------------------------------------------- rclone
@@ -282,14 +304,14 @@ VALUE_FLAGS = BISYNC_VALUE_FLAGS | FILTER_VALUE_FLAGS      # the next argument i
 # they would come last on the rclone command line and silently override it:
 # --force without a preview, a "sync" that is really a dry-run or a resync,
 # state/backup/log locations the wrapper does not know about.
-_FIXED = "it is set by webde_sync.py"
+_FIXED = "it is set by filesync.py"
 OWNED_FLAGS = {
-    "--force": "use `webde_sync.py --force`, which shows a preview first",
-    "--resync": "use `webde_sync.py --resync`", "-1": "use `webde_sync.py --resync`",
+    "--force": "use `filesync.py --force`, which shows a preview first",
+    "--resync": "use `filesync.py --resync`", "-1": "use `filesync.py --resync`",
     "--resync-mode": "set `resync_mode` in the profile",
-    "--dry-run": "use `webde_sync.py -n`", "-n": "use `webde_sync.py -n`",
-    "--interactive": "webde_sync.py asks for confirmation itself",
-    "-i": "webde_sync.py asks for confirmation itself",
+    "--dry-run": "use `filesync.py -n`", "-n": "use `filesync.py -n`",
+    "--interactive": "filesync.py asks for confirmation itself",
+    "-i": "filesync.py asks for confirmation itself",
     "--filters-file": "use `filters` / `filters_file` in the profile",
     "--backup-dir1": "backups are controlled by `backups` in the profile",
     "--backup-dir2": "backups are controlled by `backups` in the profile",
@@ -355,7 +377,7 @@ def strip_filter_flags(flags: list[str]) -> list[str]:
 
 
 def find_rclone(explicit: str | None) -> Rclone:
-    binary = explicit or os.environ.get("WEBDE_SYNC_RCLONE") or "rclone"
+    binary = explicit or os.environ.get("FILESYNC_RCLONE") or "rclone"
     path = shutil.which(binary)
     if path is None:
         raise SyncError(f"rclone not found ({binary}) -- install it, see README.md")
@@ -366,7 +388,7 @@ def find_rclone(explicit: str | None) -> Rclone:
             f"rclone v{'.'.join(map(str, ver))} is too old, bisync needs >= "
             f"v{'.'.join(map(str, MIN_RCLONE))}. Distribution packages are often older: "
             "install the current release from https://rclone.org/install/ (e.g. into "
-            "~/.local/bin) or point --rclone / $WEBDE_SYNC_RCLONE at it.")
+            "~/.local/bin) or point --rclone / $FILESYNC_RCLONE at it.")
     return rc
 
 
@@ -408,7 +430,7 @@ def check_remote_configured(rc: Rclone, remote: str) -> None:
                          "and state files -- configure them with `rclone config` instead")
     if ":" not in remote:
         raise UsageError(f"REMOTE {remote!r} is not an rclone remote path "
-                         "(expected NAME:path, e.g. webde:/Documents)")
+                         "(expected NAME:path, e.g. cloud:/Documents)")
     if remote.startswith(":"):          # on-the-fly backend, e.g. :webdav,url=...:
         return
     name = remote.split(":", 1)[0].split(",", 1)[0]
@@ -427,20 +449,54 @@ def plain_http_url(url: str) -> bool:
         and not m[1].startswith("127.")
 
 
+@dataclass(frozen=True)
+class Features:
+    """What a remote can store, decided from its backend type."""
+    mtime: bool = True       # files keep their own modification time
+    hashes: bool = True      # rclone can compare checksums
+
+
+# Backends whose listings show the upload time instead of the file's own
+# modification time: same-size edits are invisible to bisync there unless the
+# transfers are forced with --ignore-times.
+NO_MTIME_BACKENDS = {"webdav", "ftp"}
+# Backends that offer no checksums: `rclone check` must download every file.
+NO_HASH_BACKENDS = {"webdav", "ftp"}
+
+
+def remote_config(rc: Rclone, remote: str) -> dict:
+    """The rclone.conf section of a named remote.  Read in memory only;
+    nothing of it is printed or stored.  {} if it cannot be read."""
+    proc = rc.run(["config", "dump"], check=False)
+    try:
+        section = json.loads(proc.stdout).get(remote.split(":", 1)[0].split(",", 1)[0], {})
+        return section if isinstance(section, dict) else {}
+    except (ValueError, AttributeError):
+        return {}
+
+
+def remote_backend(rc: Rclone, remote: str) -> str:
+    """Backend type of a remote ('webdav', 's3', ...; '' if unknown)."""
+    if remote.startswith(":"):          # on-the-fly backend, e.g. :webdav,url=...:
+        return remote[1:].split(",", 1)[0]
+    return str(remote_config(rc, remote).get("type", ""))
+
+
+def remote_features(rc: Rclone, remote: str) -> Features:
+    """What the remote supports, judged from its backend type in rclone.conf."""
+    backend = remote_backend(rc, remote)
+    return Features(mtime=backend not in NO_MTIME_BACKENDS,
+                    hashes=backend not in NO_HASH_BACKENDS)
+
+
 def warn_plain_http(rc: Rclone, remote: str) -> None:
     if remote.startswith(":"):
         urls = re.findall(r"url\s*=\s*['\"]?([^,'\"]+)", remote)
     else:
-        # `config dump` is read in memory only; nothing of it is printed or stored
-        proc = rc.run(["config", "dump"], check=False)
-        try:
-            section = json.loads(proc.stdout).get(remote.split(":", 1)[0].split(",", 1)[0], {})
-        except (ValueError, AttributeError):
-            section = {}
-        urls = [section.get("url", "")]
+        urls = [remote_config(rc, remote).get("url", "")]
     if any(plain_http_url(u) for u in urls):
         warn(f"{remote} uses plain http://: your password and all files travel unencrypted "
-             "-- use https:// (web.de: https://webdav.smartdrive.web.de)")
+             "-- use an https:// URL instead")
 
 
 def remote_dir_exists(rc: Rclone, remote: str) -> bool:
@@ -506,7 +562,7 @@ class ProfileLock:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(self.fd)
-            raise SyncError("another webde_sync run for this profile is in progress") from None
+            raise SyncError("another filesync run for this profile is in progress") from None
 
     def release(self) -> None:
         os.close(self.fd)
@@ -541,7 +597,7 @@ def escape_glob(s: str) -> str:
 
 
 def render_filters(profile: Profile, st: State) -> str:
-    lines = ["# generated by webde_sync.py -- edit the profile instead",
+    lines = ["# generated by filesync.py -- edit the profile instead",
              f"- /{BACKUP_DIR}/**"]                    # must come first: first match wins
     try:
         rel = st.root.resolve().relative_to(profile.local)
@@ -640,10 +696,12 @@ def bisync_args(profile: Profile, st: State, *, resync: bool, dry_run: bool, for
     if resync:
         a += ["--resync-mode", profile.resync_mode]
     else:
-        # bisync detects same-size edits (via local mtimes), but the copy step
-        # then compares sizes only when the remote cannot store mtimes (web.de
-        # WebDAV) and would skip them -- force the transfers bisync decided on.
-        a.append("--ignore-times")
+        # On remotes that cannot store modification times (web.de WebDAV),
+        # bisync still detects same-size edits via the local mtime, but the
+        # copy step would then compare sizes only and skip them -- force the
+        # transfers bisync decided on (ignore_times, auto-detected per remote).
+        if profile.ignore_times:
+            a.append("--ignore-times")
         if profile.check_access:
             a.append("--check-access")
     # A dry-run moves nothing, but with backup dirs set rclone reports every file it
@@ -981,13 +1039,13 @@ def advise(rep: Report, profile: Profile, st: State, resync: bool = False) -> No
         print("\nA file on one side has the same name as a folder on the other side. "
               "Rename one of them.", file=sys.stderr)
     if "insufficient storage" in text or " 507" in text or "quota" in text:
-        print("\nThe web.de storage seems to be full: free space there (old backups are in "
+        print("\nThe remote storage seems to be full: free space there (old backups are in "
               f"{remote_join(profile.remote, BACKUP_DIR)}/) or upgrade the plan.",
               file=sys.stderr)
     if rep.safety_abort:
         print(f"\nbisync's safety check stopped the sync (more than {profile.max_delete}% "
               "deletions or all files changed). If that is really intended, review it with:\n"
-              f"  webde_sync.py {name} --force", file=sys.stderr)
+              f"  filesync.py {name} --force", file=sys.stderr)
     if rep.empty_side:
         print("\nOne side is completely empty, so bisync refused to sync (this protects "
               "against an\nunmounted disk or a wrong path wiping the other side). Check "
@@ -995,21 +1053,21 @@ def advise(rep: Report, profile: Profile, st: State, resync: bool = False) -> No
               "To really empty both, delete the files on the\nother side by hand.",
               file=sys.stderr)
     if rep.lock_error:
-        print("\nAnother `rclone bisync` (not started by webde_sync) uses this profile's "
+        print("\nAnother `rclone bisync` (not started by filesync) uses this profile's "
               f"state in {tilde(st.workdir)}. Let it finish and try again.", file=sys.stderr)
     if rep.empty_baseline:
         st.baseline.unlink(missing_ok=True)
         print(f"\nThe baseline was made while both sides were empty, and bisync cannot "
               f"continue from that\n(despite its message, retrying does not help). The next "
-              f"run of `webde_sync.py {name}` previews a\nfresh first sync instead.",
+              f"run of `filesync.py {name}` previews a\nfresh first sync instead.",
               file=sys.stderr)
     if rep.needs_resync and resync:
         print(f"\nThe first sync (resync) did not complete. Fix the cause above and run "
-              f"`webde_sync.py {name}` again.", file=sys.stderr)
+              f"`filesync.py {name}` again.", file=sys.stderr)
     elif rep.needs_resync:
         st.baseline.unlink(missing_ok=True)
         print("\nAfter this error bisync needs a fresh first sync (resync). Fix the cause "
-              f"above, then run\n`webde_sync.py {name}` interactively: it previews the "
+              f"above, then run\n`filesync.py {name}` interactively: it previews the "
               "resync (nothing gets deleted).\nUnattended -y runs stop until then.",
               file=sys.stderr)
 
@@ -1091,15 +1149,22 @@ def prune_backups(rc: Rclone, profile: Profile, now: datetime) -> None:
 
 def verify(rc: Rclone, profile: Profile, st: State, assume_yes: bool,
            max_show: int | None) -> int:
-    info("Verify compares the content of every file byte by byte. WebDAV offers no "
-         "checksums, so this downloads ALL files once -- slow and heavy on big folders.")
-    if not assume_yes and not confirm("Start the full content check?"):
-        return EXIT_ABORTED
+    if profile.verify_download:
+        info("Verify compares the content of every file byte by byte. This remote offers "
+             "no checksums, so it downloads ALL files once -- slow and heavy on big "
+             "folders.")
+        if not assume_yes and not confirm("Start the full content check?"):
+            return EXIT_ABORTED
+    else:
+        info("Verify compares checksums of every file on both sides -- the remote offers "
+             "them, so nothing has to be downloaded.")
     result = st.root / "verify.txt"          # inside the private state directory
     result.unlink(missing_ok=True)           # a hard-killed earlier run may have left one
-    cmd = rc.cmd(["check", str(profile.local), profile.remote, "--download",
-                  "--filter-from", str(st.filters), "--combined", str(result),
-                  "--color", "NEVER", *rc.flags])
+    check_args = ["check", str(profile.local), profile.remote, "--filter-from", str(st.filters),
+                  "--combined", str(result), "--color", "NEVER"]
+    if profile.verify_download:
+        check_args.append("--download")
+    cmd = rc.cmd([*check_args, *rc.flags])
     if sys.stdout.isatty():
         cmd.append("--progress")
     proc = subprocess.Popen(cmd, env=rc.env, stdin=subprocess.DEVNULL, pass_fds=rc.pass_fds)
@@ -1137,7 +1202,8 @@ def verify(rc: Rclone, profile: Profile, st: State, assume_yes: bool,
         p = groups["*"][0]
         local_file = shlex.quote(str(profile.local / p))
         info("\nFiles whose content differs were changed without a size change, which "
-             "bisync cannot\nsee on WebDAV. Decide per file which copy is right, then sync:\n"
+             "the sync cannot\ndetect (it compares sizes and file times). Decide per file "
+             "which copy is right, then sync:\n"
              f"  keep the local copy:  touch {local_file}\n"
              f"  keep the server copy: rclone copyto "
              f"{shlex.quote(remote_join(profile.remote, p))} {local_file}")
@@ -1161,9 +1227,9 @@ def non_negative(s: str) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        prog="webde_sync.py", formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Safe two-way sync of a local folder with an rclone remote "
-                    "(e.g. web.de) via `rclone bisync`, with preview and confirmation.",
+        prog="filesync.py", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Safe two-way sync of a local folder with any rclone remote "
+                    "via `rclone bisync`, with preview and confirmation.",
         epilog="Arguments after `--` go to rclone unchanged, e.g. `-- --tpslimit 4` (flags "
                "this\nwrapper controls itself, like --force or --dry-run, are refused "
                "there).\n"
@@ -1238,10 +1304,13 @@ def run(args: argparse.Namespace, extra: list[str]) -> int:
     ensure_config_password(rc)
     check_remote_configured(rc, profile.remote)
     warn_plain_http(rc, profile.remote)
-    for mode in (profile.conflict_resolve, profile.resync_mode):
-        if mode in ("newer", "older"):
-            warn(f"'{mode}' compares modification times, but WebDAV servers like web.de "
-                 "report the upload time instead of the file's own time")
+    feat = remote_features(rc, profile.remote)
+    resolve_remote_options(profile, feat)
+    if not feat.mtime:
+        for mode in (profile.conflict_resolve, profile.resync_mode):
+            if mode in ("newer", "older"):
+                warn(f"'{mode}' compares modification times, but this remote reports the "
+                     "upload time instead of the file's own time")
 
     st = state_for(profile, default_state_home())
     lock = ProfileLock(st.root / "lock")
@@ -1337,7 +1406,7 @@ def ensure_check_file(rc: Rclone, profile: Profile) -> None:
     if rc.run(["lsjson", "--stat", remote_join(profile.remote, "RCLONE_TEST")],
               check=False).returncode == 0:
         return                          # the resync brings the server's marker down
-    marker.write_text("Marker file for webde_sync.py check_access -- do not delete.\n",
+    marker.write_text("Marker file for filesync.py check_access -- do not delete.\n",
                       encoding="utf-8")
 
 

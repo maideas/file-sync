@@ -1,11 +1,11 @@
-"""Tests for webde_sync.py.
+"""Tests for filesync.py.
 
 Unit tests cover the bisync log parser and the profile/argument handling.
 Integration tests run the real script against a real `rclone serve webdav`
-server (fixed version, $WEBDE_SYNC_TEST_SERVER) whose client remote uses
+server (fixed version, $FILESYNC_TEST_SERVER) whose client remote uses
 `vendor = other` -- like web.de, it cannot
 store modification times, so the server reports upload times.  They run once
-per rclone binary listed in $WEBDE_SYNC_TEST_RCLONE (space separated; `make
+per rclone binary listed in $FILESYNC_TEST_RCLONE (space separated; `make
 test` downloads v1.66.0 and the current release) and are skipped otherwise.
 """
 
@@ -25,14 +25,14 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = ROOT / "webde_sync.py"
+SCRIPT = ROOT / "filesync.py"
 sys.path.insert(0, str(ROOT))
-import webde_sync as ws
+import filesync as ws
 
-RCLONES = [p for p in os.environ.get("WEBDE_SYNC_TEST_RCLONE", "").split() if Path(p).is_file()]
+RCLONES = [p for p in os.environ.get("FILESYNC_TEST_RCLONE", "").split() if Path(p).is_file()]
 # The WebDAV test server is one fixed binary: `rclone serve webdav` v1.76.0 itself
 # stalls for minutes on some MOVEs into new folders (a server bug, not bisync's).
-SERVER = os.environ.get("WEBDE_SYNC_TEST_SERVER") or (RCLONES[0] if RCLONES else "")
+SERVER = os.environ.get("FILESYNC_TEST_SERVER") or (RCLONES[0] if RCLONES else "")
 
 
 # ------------------------------------------------------------------ unit tests
@@ -51,7 +51,7 @@ def skipped(action: str, obj: str, size: int) -> str:
               skipped=action, size=size)
 
 
-def parse(lines, local="/data/local", remote="webde:sync"):
+def parse(lines, local="/data/local", remote="cloud:sync"):
     return ws.parse_report(ws.log_messages(lines), Path(local), remote)
 
 
@@ -61,8 +61,8 @@ def test_parse_normal_run_with_ansi_and_absolute_local_paths():
         jl("- Path1    File was deleted          - gone.txt"),
         jl("- Path2    File is new               - sub/new.txt"),
         jl("Path1:    2 changes:    0 new,    1 modified,    1 deleted", "info"),
-        jl("- Path1    Queue copy to Path2       - webde:sync/a b - c.txt"),
-        jl("- Path2    Queue delete              - webde:sync/gone.txt"),
+        jl("- Path1    Queue copy to Path2       - cloud:sync/a b - c.txt"),
+        jl("- Path2    Queue delete              - cloud:sync/gone.txt"),
         jl("- Path2    Queue copy to Path1       - /data/local/sub/new.txt"),
         skipped("copy", "sub/new.txt", 50000),
         skipped("move", "a b - c.txt", 1500),
@@ -87,7 +87,7 @@ def test_parse_conflicts_restores_and_identical_files():
         jl("- Path2    File changed: size (larger) - del.txt"),
         jl("- WARNING  New or changed in both paths       - edit.txt"),
         jl("- WARNING  New or changed in both paths       - same.txt"),
-        jl("- Path1    Queue copy to Path2       - webde:sync/edit.txt.conflict1"),
+        jl("- Path1    Queue copy to Path2       - cloud:sync/edit.txt.conflict1"),
         jl("- Path2    Queue copy to Path1       - /data/local/edit.txt.conflict2"),
         jl("- Path2    Queue copy to Path1       - /data/local/del.txt"),
     ])
@@ -104,7 +104,7 @@ def test_parse_resolved_conflict_names_the_winner_and_is_counted_once():
     rep = parse([
         jl("- Path1    File changed: size (larger) - d/edit.txt"),
         jl("- WARNING  New or changed in both paths       - d/edit.txt"),
-        jl("- Path1    Queue copy to Path2       - webde:sync/d/edit.txt"),
+        jl("- Path1    Queue copy to Path2       - cloud:sync/d/edit.txt"),
         jl("- Path2    Queue copy to Path1       - /data/local/d/edit.txt.conflict3"),
         skipped("copy", "d/edit.txt", 11),
         skipped("move", "d/edit.txt", 13),
@@ -125,7 +125,7 @@ def test_parse_resync_copies_large_files_and_errors():
         jl("Copied (new)", "info", obj="local.txt"),
         jl("Bisync aborted. Must run --resync to recover.", "error"),
         "panic: something not json",
-    ], remote="webde:")
+    ], remote="cloud:")
     assert rep.download == {"remote.txt": "resync"}
     assert rep.upload == {"photo.jpg": "resync", "local.txt": "resync"}
     assert rep.sizes["photo.jpg"] == 50000
@@ -276,7 +276,7 @@ def test_plain_http_url(url, plain):
     assert ws.plain_http_url(url) is plain
 
 
-@pytest.mark.parametrize("remote", [":webdav,url=https://x,pass=abc:", "webde,pass=abc:/x",
+@pytest.mark.parametrize("remote", [":webdav,url=https://x,pass=abc:", "cloud,pass=abc:/x",
                                     ":s3,secret_access_key=abc:b", ":sftp,key=abc:"])
 def test_inline_credentials_are_rejected(remote):
     with pytest.raises(ws.UsageError, match="credentials"):
@@ -313,8 +313,8 @@ def test_pending_conflicts_come_from_bisync_listing(tmp_path):
 def test_parse_quoted_names_and_failed_files():
     rep = parse([
         jl('- Path1    File is new               - "quo\\"te.txt"'),
-        jl('- Path1    Queue copy to Path2       - "webde:sync/quo\\"te.txt"'),
-        jl('- Path1    Queue copy to Path2       - "webde:sync/back\\\\slash.txt"'),
+        jl('- Path1    Queue copy to Path2       - "cloud:sync/quo\\"te.txt"'),
+        jl('- Path1    Queue copy to Path2       - "cloud:sync/back\\\\slash.txt"'),
         skipped("copy", 'quo"te.txt', 9),
         jl("Failed to copy: failed to open source object: open /l/s.txt: permission denied",
            "error", obj="s.txt"),
@@ -327,8 +327,8 @@ def test_parse_quoted_names_and_failed_files():
 
 
 @pytest.mark.parametrize("given, expected", [
-    ("webde:Docs/", "webde:Docs"), ("webde:/Docs//", "webde:/Docs"), ("webde:/", "webde:/"),
-    ("webde:", "webde:"), ("webde:Docs", "webde:Docs")])
+    ("cloud:Docs/", "cloud:Docs"), ("cloud:/Docs//", "cloud:/Docs"), ("cloud:/", "cloud:/"),
+    ("cloud:", "cloud:"), ("cloud:Docs", "cloud:Docs")])
 def test_remote_trailing_slashes_are_normalized(given, expected):
     assert ws.profile_from_dict(None, {"local": "/x", "remote": given}, "t").remote == expected
 
@@ -350,15 +350,15 @@ def test_backup_stamp_differs_from_last_run(tmp_path, monkeypatch):
 
 
 def test_relativizer_handles_remote_root_forms():
-    for remote, shown in (("webde:", "webde:/x/y"), ("webde:/", "webde:/x/y"),
-                          ("webde:/Docs/", "webde:/Docs/x/y"), ("webde:Docs", "webde:Docs/x/y")):
+    for remote, shown in (("cloud:", "cloud:/x/y"), ("cloud:/", "cloud:/x/y"),
+                          ("cloud:/Docs/", "cloud:/Docs/x/y"), ("cloud:Docs", "cloud:Docs/x/y")):
         assert ws._relativizer(Path("/l"), remote)("Path2", shown) == "x/y"
 
 
 def test_remote_join():
-    assert ws.remote_join("webde:", "b") == "webde:b"
-    assert ws.remote_join("webde:/", "b") == "webde:/b"
-    assert ws.remote_join("webde:/Docs", "b") == "webde:/Docs/b"
+    assert ws.remote_join("cloud:", "b") == "cloud:b"
+    assert ws.remote_join("cloud:/", "b") == "cloud:/b"
+    assert ws.remote_join("cloud:/Docs", "b") == "cloud:/Docs/b"
 
 
 @pytest.mark.parametrize("raw, err", [
@@ -367,6 +367,8 @@ def test_remote_join():
     ({"local": "/x", "remote": "r:", "max_delete": True}, "type int"),
     ({"local": "/x", "remote": "r:", "max_delete": 101}, "percentage"),
     ({"local": "/x", "remote": "r:", "filters": ["ok", 3]}, "list of strings"),
+    ({"local": "/x", "remote": "r:", "ignore_times": "yes"}, "type bool"),
+    ({"local": "/x", "remote": "r:", "verify_download": 1}, "type bool"),
     ({"local": "/x", "remote": "r:", "conflict_resolve": "mine"}, "invalid"),
 ])
 def test_profile_validation(raw, err):
@@ -383,14 +385,15 @@ def test_profile_aliases_and_defaults():
 
 def test_filters_backup_rule_first_and_state_excluded(tmp_path):
     p = ws.Profile(name="p", local=tmp_path, remote="r:", filters=["+ **"])
-    st = ws.State(tmp_path / ".local/state/webde-sync/p")
+    st = ws.State(tmp_path / ".local/state/file-sync/p")
     lines = ws.render_filters(p, st).splitlines()
     assert lines[1] == f"- /{ws.BACKUP_DIR}/**"
-    assert lines[2] == "- /.local/state/webde-sync/p/**" and lines[3] == "+ **"
+    assert lines[2] == "- /.local/state/file-sync/p/**" and lines[3] == "+ **"
 
 
 def test_bisync_args_ignore_times_only_outside_resync(tmp_path):
-    p = ws.Profile(name="p", local=tmp_path, remote="r:/x", check_access=True)
+    p = ws.Profile(name="p", local=tmp_path, remote="r:/x", check_access=True,
+                   ignore_times=True)
     st = ws.State(tmp_path / "st")
     normal = ws.bisync_args(p, st, resync=False, dry_run=True, force=False, stamp="S", extra=[])
     resync = ws.bisync_args(p, st, resync=True, dry_run=False, force=True, stamp="S", extra=["-q"])
@@ -398,6 +401,39 @@ def test_bisync_args_ignore_times_only_outside_resync(tmp_path):
     assert "--ignore-times" not in resync and "--resync-mode" in resync and "--force" in resync
     assert resync[-1] == "-q"
     assert resync[resync.index("--backup-dir2") + 1] == f"r:/x/{ws.BACKUP_DIR}/S"
+
+
+def test_bisync_args_no_ignore_times_for_mtime_capable_remotes(tmp_path):
+    p = ws.Profile(name="p", local=tmp_path, remote="r:/x")
+    st = ws.State(tmp_path / "st")
+    for ignore in (None, False):        # None = auto-detected later, False = explicit
+        p.ignore_times = ignore
+        args = ws.bisync_args(p, st, resync=False, dry_run=False, force=False,
+                             stamp="S", extra=[])
+        assert "--ignore-times" not in args
+
+
+def test_remote_features_autodetects_ignore_times_and_verify_download(tmp_path):
+    if not RCLONES:
+        pytest.skip("set FILESYNC_TEST_RCLONE (or use `make test`) for rclone-based tests")
+    conf = tmp_path / "rclone.conf"
+    conf.write_text("[wdav]\ntype = webdav\n[disk]\ntype = local\n")
+    rc = ws.Rclone(RCLONES[0])
+    rc.env["RCLONE_CONFIG"] = str(conf)
+    assert (ws.remote_features(rc, "wdav:/x").mtime,
+            ws.remote_features(rc, "wdav:/x").hashes) == (False, False)
+    assert ws.remote_features(rc, "disk:/x").mtime and ws.remote_features(rc, "disk:/x").hashes
+    assert not ws.remote_features(rc, ":webdav,url=https://x:").mtime
+    p = ws.profile_from_dict("p", {"local": "/x", "remote": "wdav:/x"}, "t")
+    ws.resolve_remote_options(p, ws.remote_features(rc, p.remote))
+    assert p.ignore_times is True and p.verify_download is True
+    p = ws.profile_from_dict("p", {"local": "/x", "remote": "disk:/x"}, "t")
+    ws.resolve_remote_options(p, ws.remote_features(rc, p.remote))
+    assert p.ignore_times is False and p.verify_download is False
+    p = ws.profile_from_dict("p", {"local": "/x", "remote": "wdav:/x",
+                                   "ignore_times": False}, "t")
+    ws.resolve_remote_options(p, ws.remote_features(rc, p.remote))
+    assert p.ignore_times is False and p.verify_download is True  # explicit wins
 
 
 # ----------------------------------------------------------- integration tests
@@ -418,11 +454,11 @@ class Env:
         (self.server / "sync").mkdir(parents=True)
         port = free_port()
         conf = tmp / "rclone.conf"
-        conf.write_text(f"[webde]\ntype = webdav\nurl = http://127.0.0.1:{port}\n"
-                        "vendor = other\n")
-        self.env = dict(os.environ, RCLONE_CONFIG=str(conf), WEBDE_SYNC_RCLONE=rclone,
+        conf.write_text(f"[cloud]\ntype = webdav\nurl = http://127.0.0.1:{port}\n"
+                        "vendor = other\n[disk]\ntype = local\n")
+        self.env = dict(os.environ, RCLONE_CONFIG=str(conf), FILESYNC_RCLONE=rclone,
                         XDG_STATE_HOME=str(tmp / "state"), XDG_CONFIG_HOME=str(tmp / "cfg"))
-        for k in ("RCLONE_CONFIG_PASS", "RCLONE_PASSWORD_COMMAND", "WEBDE_SYNC_CONFIG"):
+        for k in ("RCLONE_CONFIG_PASS", "RCLONE_PASSWORD_COMMAND", "FILESYNC_CONFIG"):
             self.env.pop(k, None)
         self.proc = subprocess.Popen(
             [SERVER, "serve", "webdav", str(self.server), "--config", os.devnull, "--addr", f"127.0.0.1:{port}",
@@ -443,7 +479,7 @@ class Env:
                               capture_output=True, check=False, env=self.env, timeout=120)
 
     def sync(self, *args: str, answers: str = "y\n") -> subprocess.CompletedProcess:
-        return self.run(str(self.local), "webde:sync", *args, answers=answers)
+        return self.run(str(self.local), "cloud:sync", *args, answers=answers)
 
     def put(self, side: Path, rel: str, text: str) -> None:
         f = side / rel
@@ -464,10 +500,30 @@ class Env:
 @pytest.fixture(params=RCLONES or [None], ids=lambda p: Path(p).name if p else "no-rclone")
 def env(request, tmp_path):
     if request.param is None:
-        pytest.skip("set WEBDE_SYNC_TEST_RCLONE (or use `make test`) for integration tests")
+        pytest.skip("set FILESYNC_TEST_RCLONE (or use `make test`) for integration tests")
     e = Env(tmp_path, request.param)
     yield e
     e.close()
+
+
+def test_mtime_capable_remote_syncs_same_size_edits_without_ignore_times(env):
+    srv = env.tmp / "srv2" / "sync"
+    srv.mkdir(parents=True)
+    pair = (str(env.local), f"disk:{srv}")
+    for i in range(5):                    # enough files that one edit is no "all changed"
+        env.put(env.local, f"keep{i}.txt", f"keep {i}\n")
+    env.put(env.local, "edit.txt", "old text")
+    r = env.run(*pair, "--resync", "-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    env.put(env.local, "edit.txt", "new text")      # same size, changed mtime
+    r = env.run(*pair, "-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (srv / "edit.txt").read_text() == "new text"
+    (srv / "edit.txt").write_text("sec text")       # same size, remote-side edit
+    r = env.run(*pair, "-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (env.local / "edit.txt").read_text() == "sec text"
+    assert not (env.local / "edit.txt.conflict1").exists()   # detected, not conflicted
 
 
 def test_first_run_needs_interactive_resync_and_creates_remote(env):
@@ -558,7 +614,7 @@ def test_conflict_keeps_both_and_modified_file_is_not_deleted(env):
 def test_resolved_conflict_reports_winner_and_loser(env):
     cfg = env.tmp / "cfg" / ws.APP
     cfg.mkdir(parents=True)
-    (cfg / "profiles.toml").write_text(f'[p]\nlocal = "{env.local}"\nremote = "webde:sync"\n'
+    (cfg / "profiles.toml").write_text(f'[p]\nlocal = "{env.local}"\nremote = "cloud:sync"\n'
                                        'conflict_resolve = "local"\n')
     for i in range(5):
         env.put(env.local, f"keep{i}.txt", f"keep {i}\n")
@@ -615,7 +671,7 @@ def test_verify_reports_same_size_server_edit_bisync_cannot_see(env):
     assert "Everything is in sync." in env.sync().stdout   # rclone limitation
     r = env.sync("--verify", "-y")
     assert r.returncode == 1 and "content differs:" in r.stdout and "doc.txt" in r.stdout
-    assert "rclone copyto webde:sync/doc.txt" in r.stdout
+    assert "rclone copyto cloud:sync/doc.txt" in r.stdout
     r = env.sync("--verify", "-y", "--max-show", "0")
     assert "... and 1 more (use --list-all)" in r.stdout
 
@@ -624,7 +680,7 @@ def test_profile_mode_filters_and_resync_on_filter_change(env):
     cfg = env.tmp / "cfg" / ws.APP
     cfg.mkdir(parents=True)
     conf = cfg / "profiles.toml"
-    conf.write_text(f'[docs]\nlocal = "{env.local}"\nremote = "webde:sync"\n'
+    conf.write_text(f'[docs]\nlocal = "{env.local}"\nremote = "cloud:sync"\n'
                     'filters = ["- *.tmp"]\n')
     env.put(env.local, "a.txt", "a\n")
     env.put(env.local, "junk.tmp", "x\n")
@@ -690,7 +746,7 @@ def test_remote_folder_vanished_is_not_treated_as_mass_delete(env):
 
 
 def test_usage_errors(env):
-    assert env.run("/nonexistent", "webde:sync").returncode == ws.EXIT_USAGE
+    assert env.run("/nonexistent", "cloud:sync").returncode == ws.EXIT_USAGE
     r = env.run(str(env.local), "nowhere:sync")
     assert r.returncode == ws.EXIT_USAGE and "not configured" in r.stderr
     r = env.run(str(env.local), "local-dir")
@@ -738,7 +794,7 @@ def test_ctrl_c_stops_cleanly_and_next_run_completes(env):
     env.baseline()
     for name in ("big1.bin", "big2.bin"):
         (env.local / name).write_bytes(os.urandom(6_000_000))
-    p = subprocess.Popen([sys.executable, str(SCRIPT), str(env.local), "webde:sync", "-y", "--",
+    p = subprocess.Popen([sys.executable, str(SCRIPT), str(env.local), "cloud:sync", "-y", "--",
                           "--bwlimit", "1M", "--transfers", "1"], env=env.env, text=True,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
     time.sleep(3)
@@ -756,7 +812,7 @@ def write_profile(env: Env, name: str, **keys) -> None:
     cfg.mkdir(parents=True, exist_ok=True)
     body = "".join(f"{k} = {json.dumps(v)}\n" for k, v in keys.items())
     with open(cfg / "profiles.toml", "a") as f:
-        f.write(f'[{name}]\nlocal = "{env.local}"\nremote = "webde:sync"\n{body}')
+        f.write(f'[{name}]\nlocal = "{env.local}"\nremote = "cloud:sync"\n{body}')
 
 
 def test_resync_overwrite_is_announced_and_permanent_without_backups(env):
@@ -808,7 +864,7 @@ def test_plain_http_remote_is_warned_about(env):
 def test_changes_between_preview_and_sync_are_reported(env):
     env.baseline()
     env.put(env.local, "planned.txt", "p\n")
-    p = subprocess.Popen([sys.executable, str(SCRIPT), str(env.local), "webde:sync"],
+    p = subprocess.Popen([sys.executable, str(SCRIPT), str(env.local), "cloud:sync"],
                          env=env.env, text=True, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     seen = ""
@@ -827,7 +883,7 @@ def test_ctrl_c_during_resync_says_it_will_repeat(env):
     import signal
     for name in ("big1.bin", "big2.bin"):
         (env.local / name).write_bytes(os.urandom(6_000_000))
-    p = subprocess.Popen([sys.executable, str(SCRIPT), str(env.local), "webde:sync",
+    p = subprocess.Popen([sys.executable, str(SCRIPT), str(env.local), "cloud:sync",
                           "--resync", "-y", "--", "--bwlimit", "1M", "--transfers", "1"],
                          env=env.env, text=True, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, start_new_session=True)
@@ -892,7 +948,7 @@ def test_special_file_names_sync_and_show_correctly(env):
     assert r.returncode == 0, r.stdout + r.stderr
     for n in ('quo"te.txt', "back\\slash.txt", "ümläut ß.txt", " lead.txt"):
         assert f"      {n}   [new, " in r.stdout, n
-    assert "webde:sync/" not in r.stdout.split("Apply")[0]      # no raw quoted paths
+    assert "cloud:sync/" not in r.stdout.split("Apply")[0]      # no raw quoted paths
     for n in names:
         assert env.remote(n).read_text() == n + "\n", n
     assert "Everything is in sync." in env.sync().stdout
@@ -936,17 +992,17 @@ def test_file_folder_name_clash_gets_a_hint(env):
 def test_whole_drive_as_remote(env):
     for i in range(5):
         env.put(env.local, f"k{i}.txt", f"{i}\n")
-    assert env.run(str(env.local), "webde:", "--resync", "-y").returncode == 0
+    assert env.run(str(env.local), "cloud:", "--resync", "-y").returncode == 0
     time.sleep(1.1)
     env.put(env.local, "k0.txt", "changed!\n")
-    r = env.run(str(env.local), "webde:", "-y")
+    r = env.run(str(env.local), "cloud:", "-y")
     assert r.returncode == 0, r.stdout + r.stderr
     assert (env.server / ws.BACKUP_DIR).is_dir() and (env.server / "k0.txt").read_text() == "changed!\n"
 
 
 def test_trailing_slash_uses_the_same_baseline(env):
     env.baseline()
-    r = env.run(str(env.local), "webde:sync/", "-n")
+    r = env.run(str(env.local), "cloud:sync/", "-n")
     assert r.returncode == 0 and "RESYNC" not in r.stdout and "no changes" in r.stdout
 
 
@@ -954,9 +1010,9 @@ def test_baseline_survives_rclone_upgrade(env):
     old, new = (str(Path(SERVER).with_name(n)) for n in ("rclone-v1.66.0", "rclone-v1.76.0"))
     if not (Path(old).is_file() and Path(new).is_file()):
         pytest.skip("needs rclone v1.66.0 and v1.76.0 in build/rclone")
-    env.env["WEBDE_SYNC_RCLONE"] = old
+    env.env["FILESYNC_RCLONE"] = old
     env.baseline()
-    env.env["WEBDE_SYNC_RCLONE"] = new
+    env.env["FILESYNC_RCLONE"] = new
     env.put(env.local, "after-upgrade.txt", "u\n")
     r = env.sync("-y")
     assert r.returncode == 0, r.stdout + r.stderr
@@ -989,7 +1045,7 @@ def filter_group_flags(rclone: str) -> dict[str, bool]:
                          ids=lambda p: Path(p).name if p else "no-rclone")
 def test_filter_flag_sets_cover_rclones_filter_group(rclone):
     if rclone is None:
-        pytest.skip("set WEBDE_SYNC_TEST_RCLONE (or use `make test`)")
+        pytest.skip("set FILESYNC_TEST_RCLONE (or use `make test`)")
     flags = filter_group_flags(rclone)
     assert len(flags) > 15 and flags["--filter"] and flags["-f"] and not flags["--ignore-case"]
     with_value = {name for name, takes_value in flags.items() if takes_value}
@@ -1010,7 +1066,7 @@ def test_wrapper_owned_flags_cannot_be_passed_through(env):
     assert env.sync("-y").returncode == 1              # the safety abort still stands
     for flags in (["--dry-run"], ["-vn"]):             # would report "Done" for a no-op
         r = env.sync("--", *flags)
-        assert r.returncode == ws.EXIT_USAGE and "webde_sync.py -n" in r.stderr, r.stderr
+        assert r.returncode == ws.EXIT_USAGE and "filesync.py -n" in r.stderr, r.stderr
         assert "Done" not in r.stdout
 
 
