@@ -5,7 +5,9 @@ remote -- web.de Online-Speicher, Nextcloud, Google Drive, S3, an SFTP server,
 ... -- with a preview of every change and a confirmation before anything
 happens.
 
-[`filesync.py`](filesync.py) is a thin wrapper around `rclone bisync`.
+[`filesync.py`](filesync.py) is an **on-demand / scheduled** wrapper around
+`rclone bisync` (not a background file-watching daemon like Dropbox or
+Syncthing: it runs when you invoke it or from cron / a systemd timer).
 rclone does all the synchronisation work: change detection against the last
 run, conflict handling, safety aborts, locking, backups and crash recovery.
 The wrapper adds what bisync lacks for everyday use:
@@ -17,6 +19,11 @@ The wrapper adds what bisync lacks for everyday use:
   WebDAV): same-size edits still get transferred (see
   [Limitations](#limitations)),
 - a guided first run, a content check (`--verify`), and logs.
+
+> **Sync is not a backup.** Two-way sync intentionally propagates edits and
+> deletions between sides. The `.file-sync-backup/` folder is a short-term
+> undo safety net (default 30 days, stored inside the synced folder), not a
+> substitute for versioned offline backups.
 
 ## Requirements
 
@@ -32,7 +39,18 @@ different binary can be selected with `--rclone PATH` or `$FILESYNC_RCLONE`.
 
 ## Setup
 
-### 1. Add the rclone remote
+### 1. Install `filesync.py`
+
+[`filesync.py`](filesync.py) is a single self-contained script using only the
+Python standard library (no `pip install` or virtual environment needed). Run
+it directly from the repo as `./filesync.py`, or put it on your `$PATH`:
+
+```bash
+mkdir -p ~/.local/bin
+ln -s "$(pwd)/filesync.py" ~/.local/bin/filesync   # or copy it there
+```
+
+### 2. Add the rclone remote
 
 Run `rclone config` and create a remote for your storage. Example for the
 web.de Online-Speicher (requires an app password from the web.de security
@@ -52,6 +70,17 @@ Any other rclone remote works the same way -- a `nextcloud:` (webdav,
 `vendor = nextcloud`), `gdrive:`, `s3:`, `sftp:` ... The examples below use a
 remote named `cloud:`.
 
+**Remote path syntax:** On WebDAV, Google Drive, and Nextcloud, `cloud:Docs`
+and `cloud:/Docs` refer to the same folder, and `cloud:` is the remote root.
+On `sftp:`, `cloud:Docs` is relative to your remote home directory while
+`cloud:/Docs` is an absolute filesystem path (`/Docs`).
+
+**Client-side encryption (optional):** If you want files encrypted before they
+leave your PC, add an rclone `crypt` remote pointing at e.g.
+`cloud:/encrypted` and use that `crypt` remote in your profile. `filesync.py`
+follows wrapped remotes (`crypt`, `alias`, `chunker`, `compress`) when
+auto-detecting modification-time and checksum support.
+
 rclone stores passwords only *obscured* (scrambled, not encrypted) in
 `~/.config/rclone/rclone.conf`. To encrypt the whole file, choose
 `s) Set configuration password` in the `rclone config` main menu.
@@ -64,7 +93,7 @@ Check the connection:
 rclone lsd cloud:
 ```
 
-### 2. Create a profile
+### 3. Create a profile
 
 ```bash
 mkdir -p ~/.config/file-sync
@@ -101,8 +130,24 @@ remotes) from `rclone config show` (in memory only; nothing of it is printed
 or stored) and can be overridden per profile with `ignore_times` /
 `verify_download`.
 
-Changing the filter rules (or `local`/`remote`) requires one resync. The
-script detects this and offers the resync on the next interactive run.
+**Filter rules are rclone rules, not `.gitignore` syntax:** every rule starts
+with `- ` (exclude) or `+ ` (include), directories need `/**` (e.g.
+`- node_modules/**`, not `node_modules`), and a leading `/` anchors to the
+synced root (e.g. `- /build/**`). Adding an exclude rule stops syncing
+matching files -- it does **not** delete copies that are already on the
+server. Changing filter rules (or `local`/`remote`) requires one resync, which
+the script detects and offers on the next interactive run.
+
+### 4. Preview and run your first sync
+
+Before pointing a profile at important folders, try a quick smoke test on a
+small throwaway folder (one resync, an edit, an overwrite, and a deletion to
+see `.file-sync-backup/` in action). Then preview and sync your profile:
+
+```bash
+./filesync.py docs -n    # preview only -- changes nothing
+./filesync.py docs       # preview, confirm [y/N], and run the initial resync
+```
 
 ## Usage
 
@@ -116,22 +161,45 @@ script detects this and offers the resync on the next interactive run.
 ./filesync.py docs -- --tpslimit 4 --bwlimit 2M       # extra rclone flags (bisync + most calls)
 ```
 
+| Option | Meaning |
+| --- | --- |
+| `-n`, `--dry-run` | Show the preview and exit without changing anything |
+| `-y`, `--yes` | Skip preview and prompts (for cron); safety checks still apply, cannot be combined with `--force` |
+| `--resync` | Merge both sides and rebuild the baseline (never deletes) |
+| `--force` | Override bisync's `max_delete` / all-files-changed safety abort (interactive preview required) |
+| `--verify` | Compare both sides (checksums if the remote supports them, full download otherwise) |
+| `--filter RULE` | Filter rule for ad-hoc runs (repeatable; profiles use `filters` in `profiles.toml`) |
+| `--max-show N` | Maximum files listed per category in output (default `25`) |
+| `--list-all` | List every file without truncating |
+| `--config FILE` | Profiles file (overrides `$FILESYNC_CONFIG` and default path) |
+| `--rclone PATH` | `rclone` binary to use (overrides `$FILESYNC_RCLONE`) |
+| `--list` | List configured profiles |
+| `--example-config` | Print a starter `profiles.toml` |
+
 Some rclone flags are set by the wrapper and are refused in `rclone_flags` and
 after `--`, because they would silently override its preview, baseline or
 report: `--force`, `--resync` (`-1`), `--resync-mode`, `--dry-run` (`-n`),
 `--interactive` (`-i`), `--filters-file`, `--backup-dir1`, `--backup-dir2`,
-`--workdir`, `--log-file` and `--use-json-log`. Use the wrapper's own options
-and profile keys instead (`--force`, `--resync`, `-n`, `resync_mode`,
-`filters`, `backups`).
+`--workdir`, `--log-file` and `--use-json-log`. Matching `RCLONE_*`
+environment variables (such as `RCLONE_FORCE`, `RCLONE_DRY_RUN`,
+`RCLONE_RESYNC`, `RCLONE_LOG_LEVEL`, `RCLONE_QUIET`) are likewise stripped so
+the environment cannot override these safeguards. Do not pass `-q`/`--quiet`
+or `--log-level` after `--` either: the wrapper passes `-v` to parse bisync's
+log, and rclone rejects combining them. Use the wrapper's own options and
+profile keys instead (`--force`, `--resync`, `-n`, `resync_mode`, `filters`,
+`backups`).
 
 ### First run
 
 The first run of a profile is a *resync*: both sides are merged, files that
 exist on only one side are copied to the other, and nothing is deleted. If a
 file exists on both sides with different sizes, the `resync_mode` side wins
-(default: local), and the other version is backed up. A missing remote
-folder is created after asking. `-y` refuses to do a first run unless
-`--resync` is given explicitly.
+(default: local), and the other version is backed up. If both sides already
+contain a file with the same name and **same size**, `--resync` assumes they
+are identical without reading their contents -- if you are merging two
+pre-existing copies of a folder, run `--verify` once afterwards to catch any
+same-size differences. A missing remote folder is created after asking. `-y`
+refuses to do a first run unless `--resync` is given explicitly.
 
 With an empty (or new) remote folder, the first run simply uploads every
 local file; the preview lists them all with their sizes. If *both* sides are
@@ -179,10 +247,25 @@ These are two separate mechanisms:
 | File changed on **both** sides | Both versions are kept *next to the file* as `.conflictN`, and both are synced. With `conflict_resolve = "none"` the original name disappears; with e.g. `"local"` the winner keeps the name and the loser becomes `.conflict1`. | Merge into the original file, delete the `.conflictN` copies. The script warns on every run until you do. |
 | File changed or deleted on **one** side | The other side is updated; its old version moves to `.file-sync-backup/<time>/` on that side. | Nothing; restore from there if needed. Pruned after `keep_backups_days`. |
 
+### Common tasks
+
+- **Restore an overwritten or deleted file:** Look in
+  `<local>/.file-sync-backup/<time>/` (if it was changed/deleted locally) or
+  `<remote>/.file-sync-backup/<time>/` (if it was changed/deleted on the
+  server) and copy the file back to its original path; the next sync
+  propagates it.
+- **Approve a legitimate mass deletion:** When bisync stops at `max_delete`
+  (or "all files changed"), review the exact deletion list with
+  `./filesync.py docs --force` and confirm `[y/N]`.
+- **Recover when cron stops needing a resync:** Fix the underlying error shown
+  in the log (e.g. file permissions or a file/folder name clash), then run
+  `./filesync.py docs` once interactively to review and complete the resync.
+  Unattended `-y` runs resume normally afterwards.
+
 ### Unattended runs
 
 ```cron
-0 * * * *  $HOME/bin/filesync.py docs -y >> $HOME/.local/state/file-sync/cron.log 2>&1
+0 * * * *  $HOME/.local/bin/filesync docs -y >> $HOME/.local/state/file-sync/cron.log 2>&1
 ```
 
 Exit codes:
@@ -293,20 +376,26 @@ digits, `_`, `.` and `-` in the name become `_`. Ad-hoc runs
 `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` replace `~/.config` and
 `~/.local/state` if they are set.
 
+> **Do not mix profiles and ad-hoc runs on the same folder pair** (or define
+> two profiles pointing at the same folders): each gets its own state
+> directory, baseline, and lock, so running both breaks change tracking and
+> allows concurrent runs against the same folders.
+
 ## Development
 
 ```bash
 make test           # unit + integration tests with rclone v1.66.0 and the current release
 make lint           # ruff
-make fetch-rclone   # download the test binaries into build/rclone/
+make fetch-rclone   # download and SHA-256-verify the test binaries into build/rclone/
 ```
 
 The integration tests in [`tests/test_filesync.py`](tests/test_filesync.py)
 run the script against `rclone serve webdav` with a `vendor = other` client
 remote -- like web.de, that server cannot store modification times and
-reports upload times (this exercises the `--ignore-times` path). A second
-scenario syncs through a `local`-type remote with real modification times and
-checks that same-size edits are detected there *without* `--ignore-times`.
+reports upload times (this exercises the `--ignore-times` path). Additional
+scenarios sync through a `local`-type remote with real modification times
+(checking that same-size edits work *without* `--ignore-times`) and through a
+`crypt` remote stacked on top of WebDAV.
 The WebDAV server is always rclone v1.66.0 (`FILESYNC_TEST_SERVER`), because
 `rclone serve webdav` v1.76.0 sometimes stalls for minutes when a file is
 moved into a new folder -- a bug in the test server only, not in bisync. The
@@ -315,10 +404,12 @@ and resolved), conflict reminders, backup layout and listing, previews of
 files >= 1 KiB, overwrite warnings without backups, `check_access`, special
 file names, unreadable files, file/folder name clashes, the whole drive as
 remote, rclone upgrades, empty sides, rclone flags via `--` (including backup
-pruning under filter flags, refused wrapper-owned flags, and the filter flag
-list against `rclone help flags`), file names that imitate rclone messages,
-stale-listing cleanup on resync, http warnings, remote capability
-auto-detection, changes between preview and sync, safety aborts, `--verify`,
+pruning under filter flags, refused wrapper-owned flags, combined short flags,
+`RCLONE_*` environment guards, and the filter flag list against
+`rclone help flags`), file names that imitate rclone messages or contain
+terminal escape sequences, stale-listing and orphan-log cleanup, http
+warnings, remote capability auto-detection (including `crypt` and wrapped
+remotes), changes between preview and sync, safety aborts, `--verify`,
 profiles, backup pruning, locking, Ctrl-C (also during a resync), and an
 encrypted rclone config.
 
