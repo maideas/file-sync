@@ -164,8 +164,12 @@ def test_flag_values_are_not_taken_for_flags():
 
 @pytest.mark.parametrize("flags, expected", [
     (["-vn"], ["-v", "-n"]), (["-1v", "-P"], ["-1", "-v", "-P"]),
+    (["-vn=true"], ["-v", "-n=true"]), (["-vn=false"], ["-v", "-n=false"]),
+    (["-v1=true"], ["-v", "-1=true"]), (["-vi=false"], ["-v", "-i=false"]),
     (["-f- *.log", "-vv"], ["-f", "- *.log", "-v", "-v"]),
     (["-vf", "-n"], ["-v", "-f", "-n"]),             # -n is the filter rule here
+    (["-vf=- x"], ["-v", "-f=- x"]),
+    (["-vf- *=foo"], ["-v", "-f", "- *=foo"]),
     (["-vf- *.LOG", "-11", "- *.pdf"], ["-v", "-f", "- *.LOG", "-11", "- *.pdf"]),
     (["-f=- x", "--exclude", "-vn", "-5d"], ["-f=- x", "--exclude", "-vn", "-5d"]),
     (["--bwlimit", "2M", "--dry-run=true"], ["--bwlimit", "2M", "--dry-run=true"]),
@@ -176,13 +180,40 @@ def test_split_short_flags(flags, expected):
 
 @pytest.mark.parametrize("flags", [
     ["--force"], ["--tpslimit", "4", "--force"], ["--resync"], ["-1"], ["--resync-mode", "path2"],
-    ["--resync-mode=path2"], ["--dry-run"], ["--dry-run=true"], ["-n"], ["-vn"], ["-i"],
+    ["--resync-mode=path2"], ["--dry-run"], ["--dry-run=true"], ["-n"], ["-vn"], ["-vn=true"],
+    ["-v1=true"], ["-vi=false"], ["-i"],
     ["--workdir", "/x"], ["--filters-file=/x"], ["--backup-dir1", "/x"], ["--backup-dir2=r:x"],
     ["--log-file", "/x"], ["--use-json-log=false"], ["-f", "- *.log", "-n"],
 ])
 def test_wrapper_owned_flags_are_refused(flags):
     with pytest.raises(ws.UsageError, match="is not accepted in rclone_flags"):
         ws.check_user_flags(ws.split_short_flags(flags))
+
+
+def test_safe_display_escapes_control_chars_and_preview_output(capsys):
+    assert ws.safe_display("ümläut ß.txt") == "ümläut ß.txt"
+    assert ws.safe_display('a\x1b[2K\rFAKE\x1b]0;pwn\x07\x9b.txt') == (
+        r"a\x1b[2K\rFAKE\x1b]0;pwn\x07\x9b.txt")
+    rep = parse([
+        jl('- Path2    Queue copy to Path1       - '
+           '"/data/local/a\\x1b[2K\\rFAKE\\x1b]0;pwn\\x07.txt"'),
+    ])
+    ws.show_report(rep, max_show=25, planned=True)
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\r" not in out and "\x07" not in out
+    assert r"a\x1b[2K\rFAKE\x1b]0;pwn\x07.txt" in out
+
+
+def test_rclone_strips_owned_env_vars(monkeypatch):
+    monkeypatch.setenv("RCLONE_FORCE", "true")
+    monkeypatch.setenv("RCLONE_DRY_RUN", "true")
+    monkeypatch.setenv("RCLONE_RESYNC", "true")
+    monkeypatch.setenv("RCLONE_LOG_LEVEL", "ERROR")
+    monkeypatch.setenv("RCLONE_CONFIG", "/tmp/my.conf")
+    rc = ws.Rclone("rclone")
+    for k in ("RCLONE_FORCE", "RCLONE_DRY_RUN", "RCLONE_RESYNC", "RCLONE_LOG_LEVEL"):
+        assert k not in rc.env
+    assert rc.env["RCLONE_CONFIG"] == "/tmp/my.conf"
 
 
 @pytest.mark.parametrize("flags", [
@@ -269,6 +300,7 @@ def test_clear_stale_listings_drops_listings_but_not_locks(tmp_path):
 
 @pytest.mark.parametrize("url, plain", [
     ("http://webdav.example.org", True), ("HTTP://10.0.0.5:8080/dav", True),
+    ("http://127.evil.example", True), ("http://127.0.0.1@evil.example/dav", True),
     ("https://webdav.smartdrive.web.de", False), ("http://127.0.0.1:18080", False),
     ("http://localhost/dav", False), ("http://[::1]:80", False), ("", False),
 ])
@@ -276,8 +308,12 @@ def test_plain_http_url(url, plain):
     assert ws.plain_http_url(url) is plain
 
 
-@pytest.mark.parametrize("remote", [":webdav,url=https://x,pass=abc:", "cloud,pass=abc:/x",
-                                    ":s3,secret_access_key=abc:b", ":sftp,key=abc:"])
+@pytest.mark.parametrize("remote", [
+    ":webdav,url=https://x,pass=abc:", "cloud,pass=abc:/x",
+    ":s3,secret_access_key=abc:b", ":sftp,key=abc:",
+    ":webdav,url=https://user:mysecret@webdav.example.com/dav:",
+    ":http,url=https://u:p@example.com:",
+])
 def test_inline_credentials_are_rejected(remote):
     with pytest.raises(ws.UsageError, match="credentials"):
         ws.check_remote_configured(None, remote)
@@ -413,17 +449,39 @@ def test_bisync_args_no_ignore_times_for_mtime_capable_remotes(tmp_path):
         assert "--ignore-times" not in args
 
 
-def test_remote_features_autodetects_ignore_times_and_verify_download(tmp_path):
+def test_remote_features_autodetects_ignore_times_and_verify_download(tmp_path, capsys):
     if not RCLONES:
         pytest.skip("set FILESYNC_TEST_RCLONE (or use `make test`) for rclone-based tests")
     conf = tmp_path / "rclone.conf"
-    conf.write_text("[wdav]\ntype = webdav\n[disk]\ntype = local\n")
+    conf.write_text(
+        "[wdav]\ntype = webdav\nurl = http://webdav.example.org/dav\n"
+        "[disk]\ntype = local\n"
+        "[my cloud]\ntype = local\n"
+        "[wdav-crypt]\ntype = crypt\nremote = wdav:/enc\n"
+        "[disk-crypt]\ntype = crypt\nremote = disk:/enc\n"
+        "[wdav-alias]\ntype = alias\nremote = wdav:/sub\n"
+    )
     rc = ws.Rclone(RCLONES[0])
     rc.env["RCLONE_CONFIG"] = str(conf)
+    ws.check_remote_configured(rc, "my cloud:/x")                # spaces in remote name
     assert (ws.remote_features(rc, "wdav:/x").mtime,
             ws.remote_features(rc, "wdav:/x").hashes) == (False, False)
     assert ws.remote_features(rc, "disk:/x").mtime and ws.remote_features(rc, "disk:/x").hashes
     assert not ws.remote_features(rc, ":webdav,url=https://x:").mtime
+    assert (ws.remote_features(rc, ":webdav:/x").mtime,
+            ws.remote_features(rc, ":webdav:/x").hashes) == (False, False)
+    # Wrapped remotes inherit mtime/hash limitations and crypt never has hashes
+    assert (ws.remote_features(rc, "wdav-crypt:/x").mtime,
+            ws.remote_features(rc, "wdav-crypt:/x").hashes) == (False, False)
+    assert (ws.remote_features(rc, "disk-crypt:/x").mtime,
+            ws.remote_features(rc, "disk-crypt:/x").hashes) == (True, False)
+    assert (ws.remote_features(rc, "wdav-alias:/x").mtime,
+            ws.remote_features(rc, "wdav-alias:/x").hashes) == (False, False)
+    # Plain http warning follows wrapped remotes and inline overrides on named remotes
+    ws.warn_plain_http(rc, "wdav-crypt:/x")
+    assert "plain http://" in capsys.readouterr().err
+    ws.warn_plain_http(rc, "disk,url=http://evil.example:/x")
+    assert "plain http://" in capsys.readouterr().err
     p = ws.profile_from_dict("p", {"local": "/x", "remote": "wdav:/x"}, "t")
     ws.resolve_remote_options(p, ws.remote_features(rc, p.remote))
     assert p.ignore_times is True and p.verify_download is True
@@ -1064,10 +1122,78 @@ def test_wrapper_owned_flags_cannot_be_passed_through(env):
         assert r.returncode == ws.EXIT_USAGE and "is not accepted" in r.stderr, r.stderr
     assert len(list(env.remote("").glob("keep*.txt"))) == 6
     assert env.sync("-y").returncode == 1              # the safety abort still stands
-    for flags in (["--dry-run"], ["-vn"]):             # would report "Done" for a no-op
+    for flags in (["--dry-run"], ["-vn"], ["-vn=true"], ["-v1=true"]):
         r = env.sync("--", *flags)
-        assert r.returncode == ws.EXIT_USAGE and "filesync.py -n" in r.stderr, r.stderr
+        assert r.returncode == ws.EXIT_USAGE and "is not accepted" in r.stderr, r.stderr
         assert "Done" not in r.stdout
+
+
+def test_rclone_env_vars_cannot_bypass_safety_guards(env):
+    env.baseline(6)
+    for p in sorted(env.local.glob("keep*.txt"))[1:]:
+        p.unlink()                                     # 5 of 6 files gone
+    old_env = dict(env.env)
+    try:
+        env.env["RCLONE_FORCE"] = "true"
+        r = env.sync("-y")
+        assert r.returncode == 1 and "--force" in r.stderr
+        assert len(list(env.remote("").glob("keep*.txt"))) == 6
+    finally:
+        env.env = old_env
+    # Restore files and verify RCLONE_DRY_RUN cannot turn a real sync into a no-op
+    for i in range(1, 6):
+        env.put(env.local, f"keep{i}.txt", f"keep {i}\n")
+    env.put(env.local, "real.txt", "real\n")
+    try:
+        env.env["RCLONE_DRY_RUN"] = "true"
+        r = env.sync("-y")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert env.remote("real.txt").read_text() == "real\n"
+    finally:
+        env.env = old_env
+
+
+def test_crypt_over_webdav_syncs_same_size_edits_and_verifies_content(env):
+    pw = subprocess.run([env.rclone, "obscure", "test-pass"],
+                        capture_output=True, text=True, check=True).stdout.strip()
+    (env.server / "enc").mkdir()
+    conf = Path(env.env["RCLONE_CONFIG"])
+    conf.write_text(conf.read_text() +
+                    f"[cloud-crypt]\ntype = crypt\nremote = cloud:enc\npassword = {pw}\n")
+    for i in range(5):
+        env.put(env.local, f"keep{i}.txt", f"keep {i}\n")
+    env.put(env.local, "same.txt", "AAAA\n")
+    r = env.run(str(env.local), "cloud-crypt:", "--resync", "-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    time.sleep(1.1)
+    # Same-size local edit must reach encrypted WebDAV (auto ignore_times through crypt)
+    env.put(env.local, "same.txt", "BBBB\n")
+    r = env.run(str(env.local), "cloud-crypt:", "-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    # --verify must auto-download and confirm both sides match
+    r = env.run(str(env.local), "cloud-crypt:", "--verify", "-y")
+    assert r.returncode == 0 and "Both sides are identical." in r.stdout, r.stdout + r.stderr
+    # Same-size divergence (e.g. local mutated without syncing) must be caught by --verify
+    env.put(env.local, "same.txt", "CCCC\n")
+    r = env.run(str(env.local), "cloud-crypt:", "--verify", "-y")
+    assert r.returncode == 1 and "content differs:" in r.stdout and "same.txt" in r.stdout
+    # Explicitly forcing verify_download = false on a hashless crypt remote is refused
+    cfg = env.tmp / "cfg" / ws.APP
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "profiles.toml").write_text(
+        f'[cc]\nlocal = "{env.local}"\nremote = "cloud-crypt:"\nverify_download = false\n')
+    r = env.run("cc", "--verify", "-y")
+    assert r.returncode == 1 and "offers no checksums" in r.stderr
+
+
+def test_orphan_jsonl_logs_are_cleaned_up(env):
+    env.baseline()
+    logs = next((env.tmp / "state" / ws.APP).glob("adhoc-*")) / "logs"
+    orphan = logs / "2020-01-01_000000.jsonl"
+    orphan.write_text('{"level":"info","msg":"stale"}\n')
+    r = env.sync("-y")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not orphan.exists()
 
 
 def test_file_names_that_look_like_rclone_messages_sync_normally(env):

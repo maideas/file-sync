@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import configparser
 import fcntl
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -47,6 +49,7 @@ import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 APP = "file-sync"
 MIN_RCLONE = (1, 66, 0)
@@ -110,6 +113,15 @@ def tilde(p: Path | str) -> str:
     """Show paths below $HOME as ~/... (shorter, and no user name in output)."""
     s, home = str(p), str(Path.home())
     return "~" + s[len(home):] if s == home or s.startswith(home + "/") else s
+
+
+RE_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CTRL_NAMES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def safe_display(s: str) -> str:
+    """Escape C0/C1 control characters before printing untrusted remote text to a terminal."""
+    return RE_CTRL.sub(lambda m: _CTRL_NAMES.get(m.group(), f"\\x{ord(m.group()):02x}"), s)
 
 
 # --------------------------------------------------------------------- profiles
@@ -244,37 +256,6 @@ def resolve_remote_options(profile: Profile, feat: Features) -> None:
 
 # ----------------------------------------------------------------------- rclone
 
-class Rclone:
-    """Thin runner for the rclone binary with a private environment."""
-
-    def __init__(self, binary: str):
-        self.binary = binary
-        self.env = dict(os.environ)
-        self.pass_fds: tuple[int, ...] = ()   # the profile lock, inherited by rclone
-        self.flags: list[str] = []            # user flags valid for every command
-
-    def cmd(self, args: list[str]) -> list[str]:
-        return [self.binary, *args]
-
-    def run(self, args: list[str], check: bool = True,
-            add_flags: bool = True) -> subprocess.CompletedProcess:
-        proc = subprocess.run(self.cmd(args + (self.flags if add_flags else [])),
-                              capture_output=True, text=True,
-                              check=False,
-                              stdin=subprocess.DEVNULL, env=self.env, pass_fds=self.pass_fds)
-        if check and proc.returncode != 0:
-            raise SyncError(f"`rclone {' '.join(args)}` failed (exit {proc.returncode}):\n"
-                            f"{proc.stderr.strip()}")
-        return proc
-
-    def version(self) -> tuple[int, int, int]:
-        out = self.run(["version"]).stdout
-        m = re.search(r"rclone v(\d+)\.(\d+)\.(\d+)", out)
-        if not m:
-            raise SyncError(f"cannot determine the rclone version from: {out[:80]!r}")
-        return int(m[1]), int(m[2]), int(m[3])
-
-
 # Flags that only `rclone bisync` knows; other commands (lsf, check, ...) reject them.
 BISYNC_VALUE_FLAGS = {"--backup-dir1", "--backup-dir2", "--check-filename", "--check-sync",
                       "--compare", "--conflict-loser", "--conflict-resolve", "--conflict-suffix",
@@ -317,25 +298,85 @@ OWNED_FLAGS = {
     "--backup-dir2": "backups are controlled by `backups` in the profile",
     "--workdir": _FIXED, "--log-file": _FIXED, "--use-json-log": _FIXED,
 }
+# Matching RCLONE_* environment variables: strip them so the caller's environment
+# cannot silently override safety guards or break log parsing / housekeeping calls.
+OWNED_ENV = {
+    f"RCLONE_{flag.lstrip('-').upper().replace('-', '_')}"
+    for flag in OWNED_FLAGS if flag.startswith("--")
+} | {"RCLONE_LOG_LEVEL", "RCLONE_QUIET", "RCLONE_VERBOSE", "RCLONE_COLOR", "RCLONE_COMBINED"}
+FILTER_ENV = {
+    f"RCLONE_{flag.lstrip('-').upper().replace('-', '_')}"
+    for flag in (FILTER_VALUE_FLAGS | FILTER_BOOL_FLAGS) if flag.startswith("--")
+}
 RE_SHORT_FLAGS = re.compile(r"[A-Za-z1]*")       # rclone's one-letter flags, e.g. -v -n -1
+
+
+class Rclone:
+    """Thin runner for the rclone binary with a private environment."""
+
+    def __init__(self, binary: str):
+        self.binary = binary
+        self.env = {k: v for k, v in os.environ.items() if k not in OWNED_ENV}
+        self.pass_fds: tuple[int, ...] = ()   # the profile lock, inherited by rclone
+        self.flags: list[str] = []            # user flags valid for housekeeping commands
+
+    def cmd(self, args: list[str]) -> list[str]:
+        return [self.binary, *args]
+
+    def run(self, args: list[str], check: bool = True,
+            add_flags: bool = True) -> subprocess.CompletedProcess:
+        env = ({k: v for k, v in self.env.items() if k not in FILTER_ENV}
+               if add_flags else self.env)
+        proc = subprocess.run(self.cmd(args + (self.flags if add_flags else [])),
+                              capture_output=True, text=True,
+                              check=False,
+                              stdin=subprocess.DEVNULL, env=env, pass_fds=self.pass_fds)
+        if check and proc.returncode != 0:
+            raise SyncError(f"`rclone {' '.join(args)}` failed (exit {proc.returncode}):\n"
+                            f"{proc.stderr.strip()}")
+        return proc
+
+    def version(self) -> tuple[int, int, int]:
+        out = self.run(["version"]).stdout
+        m = re.search(r"rclone v(\d+)\.(\d+)\.(\d+)", out)
+        if not m:
+            raise SyncError(f"cannot determine the rclone version from: {out[:80]!r}")
+        return int(m[1]), int(m[2]), int(m[3])
 
 
 def split_short_flags(flags: list[str]) -> list[str]:
     """Spell out combined one-letter flags the way rclone reads them (-vn ->
-    -v -n, -fRULE -> -f RULE), so the checks below see every flag.  Only used
-    for those checks and the helper calls; bisync gets the user's own spelling."""
+    -v -n, -vn=true -> -v -n=true, -fRULE -> -f RULE), so the checks below see
+    every flag.  Only used for those checks and the helper calls; bisync gets
+    the user's own spelling."""
     out, is_value = [], False
     for f in flags:
         if is_value or f.startswith("--") or len(f) <= 2 or f[0] != "-" or f[2] == "=":
             out.append(f)
             is_value = not is_value and f in VALUE_FLAGS
             continue
-        head, has_f, rule = f[1:].partition("f")        # -f is the only one with a value
-        if RE_SHORT_FLAGS.fullmatch(head) and (has_f or not head.isdigit()):
-            out += [f"-{c}" for c in head] + (["-f"] if has_f else []) + ([rule] if rule else [])
-            is_value = bool(has_f) and not rule
-        else:                                           # e.g. a stray value like -5d
-            out.append(f)
+        raw = f[1:]
+        fi, ei = raw.find("f"), raw.find("=")
+        if fi != -1 and (ei == -1 or fi < ei):          # -f before any '=': rest is its rule
+            head, rule = raw[:fi], raw[fi + 1:]
+            if RE_SHORT_FLAGS.fullmatch(head):
+                if rule.startswith("="):
+                    out += [f"-{c}" for c in head] + [f"-f{rule}"]
+                    is_value = False
+                else:
+                    out += [f"-{c}" for c in head] + ["-f"] + ([rule] if rule else [])
+                    is_value = not rule
+                continue
+        else:                                           # e.g. -vn, -vn=true, -vn=false
+            head, eq, eq_val = raw.partition("=")
+            if head and RE_SHORT_FLAGS.fullmatch(head) and not head.isdigit():
+                parts = [f"-{c}" for c in head]
+                if eq:
+                    parts[-1] += eq + eq_val
+                out += parts
+                is_value = False
+                continue
+        out.append(f)                                   # e.g. a stray value like -5d
     return out
 
 
@@ -422,10 +463,11 @@ def ensure_config_password(rc: Rclone) -> None:
 
 
 RE_INLINE_SECRET = re.compile(r"[,:]\s*([A-Za-z_]*(?:pass|token|secret)[A-Za-z_]*|key)\s*=", re.IGNORECASE)
+RE_URL_CREDS = re.compile(r"://[^/:@,'\"\s]+:[^/@,'\"\s]+@")
 
 
 def check_remote_configured(rc: Rclone, remote: str) -> None:
-    if RE_INLINE_SECRET.search(remote):
+    if RE_INLINE_SECRET.search(remote) or RE_URL_CREDS.search(remote):
         raise UsageError("REMOTE contains credentials; they would end up in the output, logs "
                          "and state files -- configure them with `rclone config` instead")
     if ":" not in remote:
@@ -436,17 +478,29 @@ def check_remote_configured(rc: Rclone, remote: str) -> None:
     name = remote.split(":", 1)[0].split(",", 1)[0]
     if "/" in name:
         raise UsageError(f"REMOTE {remote!r} looks like a local path, not NAME:path")
-    configured = rc.run(["listremotes"]).stdout.split()
+    configured = [line.strip() for line in rc.run(["listremotes"]).stdout.splitlines()
+                  if line.strip()]
     if f"{name}:" not in configured:
         raise UsageError(f"rclone remote '{name}:' is not configured (have: "
-                         f"{' '.join(configured) or 'none'}) -- run `rclone config`")
+                         f"{', '.join(configured) or 'none'}) -- run `rclone config`")
 
 
 def plain_http_url(url: str) -> bool:
     """True for http:// URLs that leave this machine (password + files unencrypted)."""
-    m = re.match(r"\s*http://(\[[^\]]*\]|[^/:]*)", url, re.IGNORECASE)
-    return bool(m) and m[1].lower() not in ("localhost", "[::1]") \
-        and not m[1].startswith("127.")
+    s = url.strip()
+    try:
+        parsed = urlsplit(s)
+    except ValueError:
+        return s.lower().startswith("http://")
+    if parsed.scheme.lower() != "http" or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower()
+    if host == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
 
 
 @dataclass(frozen=True)
@@ -461,42 +515,84 @@ class Features:
 # transfers are forced with --ignore-times.
 NO_MTIME_BACKENDS = {"webdav", "ftp"}
 # Backends that offer no checksums: `rclone check` must download every file.
-NO_HASH_BACKENDS = {"webdav", "ftp"}
+NO_HASH_BACKENDS = {"webdav", "ftp", "crypt"}
+# Wrapping backends whose capabilities and URLs also depend on their `remote`.
+WRAPPING_BACKENDS = {"crypt", "alias", "chunker", "compress", "hasher"}
 
 
-def remote_config(rc: Rclone, remote: str) -> dict:
-    """The rclone.conf section of a named remote.  Read in memory only;
-    nothing of it is printed or stored.  {} if it cannot be read."""
-    proc = rc.run(["config", "dump"], check=False)
-    try:
-        section = json.loads(proc.stdout).get(remote.split(":", 1)[0].split(",", 1)[0], {})
-        return section if isinstance(section, dict) else {}
-    except (ValueError, AttributeError):
+def remote_config(rc: Rclone, name: str) -> dict[str, str]:
+    """One section of rclone.conf via `rclone config show <name>` (never dumps
+    unrelated remotes).  Read in memory only; {} if it cannot be read."""
+    proc = rc.run(["config", "show", name], check=False)
+    if proc.returncode != 0:
         return {}
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read_string(proc.stdout)
+    except configparser.Error:
+        return {}
+    return dict(cp[name]) if name in cp else {}
 
 
-def remote_backend(rc: Rclone, remote: str) -> str:
-    """Backend type of a remote ('webdav', 's3', ...; '' if unknown)."""
-    if remote.startswith(":"):          # on-the-fly backend, e.g. :webdav,url=...:
-        return remote[1:].split(",", 1)[0]
-    return str(remote_config(rc, remote).get("type", ""))
+def remote_chain(rc: Rclone, remote: str) -> list[tuple[str, dict[str, str]]]:
+    """Backend types and config sections along a remote and any wrappers it
+    stacks (crypt, alias, chunker, compress, hasher)."""
+    chain: list[tuple[str, dict[str, str]]] = []
+    seen: set[str] = set()
+    cur = remote
+    while cur and cur not in seen:
+        seen.add(cur)
+        inline = {k.lower(): v for k, v in re.findall(
+            r"[,:]\s*(url|endpoint)\s*=\s*['\"]?([^,'\"]+)", cur, re.IGNORECASE)}
+        if cur.startswith(":"):
+            backend = cur[1:].split(":", 1)[0].split(",", 1)[0].lower()
+            chain.append((backend, inline))
+            break
+        if ":" not in cur:
+            break                           # local path wrapped by e.g. crypt/alias
+        name = cur.split(":", 1)[0].split(",", 1)[0]
+        section = remote_config(rc, name)
+        if inline:
+            section = {**section, **inline}
+        backend = str(section.get("type", "")).lower()
+        chain.append((backend, section))
+        if backend in WRAPPING_BACKENDS and section.get("remote"):
+            cur = section["remote"]
+        else:
+            break
+    return chain
 
 
-def remote_features(rc: Rclone, remote: str) -> Features:
-    """What the remote supports, judged from its backend type in rclone.conf."""
-    backend = remote_backend(rc, remote)
-    return Features(mtime=backend not in NO_MTIME_BACKENDS,
-                    hashes=backend not in NO_HASH_BACKENDS)
+def remote_features(rc: Rclone, remote: str,
+                    chain: list[tuple[str, dict[str, str]]] | None = None) -> Features:
+    """What the remote supports, judged from its backend chain in rclone.conf."""
+    if chain is None:
+        chain = remote_chain(rc, remote)
+    backends = {backend for backend, _ in chain}
+    return Features(mtime=not (backends & NO_MTIME_BACKENDS),
+                    hashes=not (backends & NO_HASH_BACKENDS))
 
 
-def warn_plain_http(rc: Rclone, remote: str) -> None:
-    if remote.startswith(":"):
-        urls = re.findall(r"url\s*=\s*['\"]?([^,'\"]+)", remote)
-    else:
-        urls = [remote_config(rc, remote).get("url", "")]
+def warn_plain_http(rc: Rclone, remote: str,
+                    chain: list[tuple[str, dict[str, str]]] | None = None) -> None:
+    if chain is None:
+        chain = remote_chain(rc, remote)
+    urls = [section.get(k, "") for _, section in chain for k in ("url", "endpoint")]
     if any(plain_http_url(u) for u in urls):
         warn(f"{remote} uses plain http://: your password and all files travel unencrypted "
              "-- use an https:// URL instead")
+
+
+def remote_has_hashes(rc: Rclone, remote: str) -> bool | None:
+    """Ask rclone whether the remote actually exposes checksums (None if unknown)."""
+    proc = rc.run(["backend", "features", remote], check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        hashes = json.loads(proc.stdout).get("Hashes")
+    except (ValueError, AttributeError):
+        return None
+    return bool(hashes) if isinstance(hashes, list) else None
 
 
 def remote_dir_exists(rc: Rclone, remote: str) -> bool:
@@ -544,7 +640,7 @@ def state_for(profile: Profile, state_home: Path) -> State:
             f"{profile.local}\0{profile.remote}".encode()).hexdigest()[:16]
     st = State(state_home / key)
     for d in (state_home, st.root, st.workdir, st.logs):
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
         d.chmod(0o700)        # listings reveal the whole file inventory
     return st
 
@@ -563,6 +659,9 @@ class ProfileLock:
         except BlockingIOError:
             os.close(self.fd)
             raise SyncError("another filesync run for this profile is in progress") from None
+        except BaseException:
+            os.close(self.fd)
+            raise
 
     def release(self) -> None:
         os.close(self.fd)
@@ -662,8 +761,7 @@ def listing_is_empty(st: State) -> bool:
 
 def local_has_files(rc: Rclone, profile: Profile, st: State) -> bool:
     proc = rc.run(["lsf", "-R", "--files-only", "--filter-from", str(st.filters),
-                   *strip_filter_flags(rc.flags), str(profile.local)],
-                  check=False, add_flags=False)
+                   str(profile.local)], check=False)
     return proc.returncode != 0 or bool(proc.stdout.strip())
 
 
@@ -957,13 +1055,13 @@ def show_report(rep: Report, max_show: int | None, planned: bool) -> None:
         limit = len(items) if max_show is None else max_show
         for p, why in items[:limit]:
             sz = f", {human(rep.sizes[p])}" if p in rep.sizes and planned else ""
-            info(f"      {p}   [{why}{sz}]")
+            info(f"      {safe_display(p)}   [{safe_display(why)}{sz}]")
         if len(items) > limit:
             info(f"      ... and {len(items) - limit} more (use --list-all)")
     if rep.symlinks:
         info(f"  skipped symlinks:     {len(rep.symlinks):>6} (rclone does not follow them)")
     for w in rep.warnings:
-        warn(w)
+        warn(safe_display(w))
 
 
 def pending_conflicts(profile: Profile, st: State) -> list[str]:
@@ -991,7 +1089,7 @@ def remind_conflicts(profile: Profile, st: State, max_show: int | None) -> None:
     copies = "1 conflict copy waits" if len(pending) == 1 else f"{len(pending)} conflict copies wait"
     lines = [f"warning: {copies} to be merged (the file was changed on both sides):"]
     limit = len(pending) if max_show is None else max_show
-    lines += [f"    {p}" for p in pending[:limit]]
+    lines += [f"    {safe_display(p)}" for p in pending[:limit]]
     if len(pending) > limit:
         lines.append(f"    ... and {len(pending) - limit} more (use --list-all)")
     lines.append("  Merge each into its original file, then delete the .conflictN copy -- "
@@ -1006,8 +1104,7 @@ def show_backups(rc: Rclone, profile: Profile, stamp: str, max_show: int | None)
     found = []
     for side, root in (("local ", str(profile.local)), ("server", profile.remote)):
         bdir = remote_join(root, f"{BACKUP_DIR}/{stamp}")
-        proc = rc.run(["lsf", "-R", "--files-only", *strip_filter_flags(rc.flags),
-                       bdir], check=False, add_flags=False)
+        proc = rc.run(["lsf", "-R", "--files-only", bdir], check=False)
         files = sorted(proc.stdout.splitlines()) if proc.returncode == 0 else []
         if files:
             found.append((side, tilde(bdir) + "/", files))
@@ -1018,7 +1115,7 @@ def show_backups(rc: Rclone, profile: Profile, stamp: str, max_show: int | None)
         info(f"  {side}: {len(files)} file(s) in {bdir}")
         limit = len(files) if max_show is None else max_show
         for f in files[:limit]:
-            info(f"      {f}")
+            info(f"      {safe_display(f)}")
         if len(files) > limit:
             info(f"      ... and {len(files) - limit} more (use --list-all)")
 
@@ -1026,12 +1123,12 @@ def show_backups(rc: Rclone, profile: Profile, stamp: str, max_show: int | None)
 def advise(rep: Report, profile: Profile, st: State, resync: bool = False) -> None:
     """Explain failed runs in terms of what the user can do next."""
     for e in rep.errors:
-        print(f"rclone: {e}", file=sys.stderr)
+        print(f"rclone: {safe_display(e)}", file=sys.stderr)
     name = profile.name or f"{tilde(profile.local)} {profile.remote}"
     if rep.failed:
         print("\nThese files could not be transferred:", file=sys.stderr)
         for path, why in sorted(rep.failed.items()):
-            print(f"    {path}  ({why})", file=sys.stderr)
+            print(f"    {safe_display(path)}  ({safe_display(why)})", file=sys.stderr)
         print("  Fix the cause (permissions, a file in use, ...) or exclude the files with "
               "a filter rule.", file=sys.stderr)
     text = " ".join(rep.errors).lower()
@@ -1132,14 +1229,12 @@ def prune_backups(rc: Rclone, profile: Profile, now: datetime) -> None:
     cutoff = now - timedelta(days=profile.keep_backups_days)
     for root in (str(profile.local), profile.remote):
         bdir = remote_join(root, BACKUP_DIR)
-        proc = rc.run(["lsf", "--dirs-only", "--max-depth", "1",
-                       *strip_filter_flags(rc.flags), bdir], check=False, add_flags=False)
+        proc = rc.run(["lsf", "--dirs-only", "--max-depth", "1", bdir], check=False)
         for name in proc.stdout.splitlines() if proc.returncode == 0 else []:
             name = name.rstrip("/")
             try:
                 if datetime.strptime(name, STAMP_FMT).astimezone() < cutoff:
-                    rc.run(["purge", *strip_filter_flags(rc.flags), remote_join(bdir, name)],
-                           add_flags=False)
+                    rc.run(["purge", remote_join(bdir, name)])
                     info(f"pruned old backup {remote_join(bdir, name)}")
             except ValueError:
                 continue                # not one of ours, leave it alone
@@ -1148,8 +1243,16 @@ def prune_backups(rc: Rclone, profile: Profile, now: datetime) -> None:
 
 
 def verify(rc: Rclone, profile: Profile, st: State, assume_yes: bool,
-           max_show: int | None) -> int:
-    if profile.verify_download:
+           max_show: int | None, check_flags: list[str] | None = None,
+           verify_download_explicit: bool = False) -> int:
+    download = bool(profile.verify_download)
+    if not download and remote_has_hashes(rc, profile.remote) is False:
+        if verify_download_explicit:
+            raise SyncError("this remote offers no checksums, so `--verify` with "
+                            "`verify_download = false` would only compare file sizes -- "
+                            "remove `verify_download = false` (or set it to true)")
+        download = True
+    if download:
         info("Verify compares the content of every file byte by byte. This remote offers "
              "no checksums, so it downloads ALL files once -- slow and heavy on big "
              "folders.")
@@ -1162,9 +1265,9 @@ def verify(rc: Rclone, profile: Profile, st: State, assume_yes: bool,
     result.unlink(missing_ok=True)           # a hard-killed earlier run may have left one
     check_args = ["check", str(profile.local), profile.remote, "--filter-from", str(st.filters),
                   "--combined", str(result), "--color", "NEVER"]
-    if profile.verify_download:
+    if download:
         check_args.append("--download")
-    cmd = rc.cmd([*check_args, *rc.flags])
+    cmd = rc.cmd([*check_args, *(rc.flags if check_flags is None else check_flags)])
     if sys.stdout.isatty():
         cmd.append("--progress")
     proc = subprocess.Popen(cmd, env=rc.env, stdin=subprocess.DEVNULL, pass_fds=rc.pass_fds)
@@ -1193,20 +1296,20 @@ def verify(rc: Rclone, profile: Profile, st: State, assume_yes: bool,
         info(f"  {title + ':':<24}{len(paths):>6} file(s)")
         limit = len(paths) if max_show is None else max_show
         for p in paths[:limit]:
-            info(f"      {p}")
+            info(f"      {safe_display(p)}")
         if len(paths) > limit:
             info(f"      ... and {len(paths) - limit} more (use --list-all)")
     if code not in (0, 1) or (code == 1 and not any(groups.values())):
         raise SyncError(f"rclone check failed (exit {code}), see its messages above")
     if groups["*"]:
         p = groups["*"][0]
-        local_file = shlex.quote(str(profile.local / p))
+        local_file = safe_display(shlex.quote(str(profile.local / p)))
+        remote_file = safe_display(shlex.quote(remote_join(profile.remote, p)))
         info("\nFiles whose content differs were changed without a size change, which "
              "the sync cannot\ndetect (it compares sizes and file times). Decide per file "
              "which copy is right, then sync:\n"
              f"  keep the local copy:  touch {local_file}\n"
-             f"  keep the server copy: rclone copyto "
-             f"{shlex.quote(remote_join(profile.remote, p))} {local_file}")
+             f"  keep the server copy: rclone copyto {remote_file} {local_file}")
     if groups["+"] or groups["-"]:
         info("\nFiles on one side only are normally handled by the next sync (or were "
              "excluded/skipped); run a sync and verify again.")
@@ -1246,7 +1349,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--force", action="store_true",
                     help="override bisync's max-delete / all-files-changed safety abort")
     ap.add_argument("--verify", action="store_true",
-                    help="byte-compare both sides (downloads everything)")
+                    help="compare both sides (checksums, or downloads if remote lacks them)")
     ap.add_argument("--filter", action="append", default=[], metavar="RULE",
                     help="rclone filter rule for ad-hoc runs, e.g. '- .git/**'")
     ap.add_argument("--max-show", type=non_negative, default=25, metavar="N",
@@ -1300,11 +1403,14 @@ def run(args: argparse.Namespace, extra: list[str]) -> int:
     if profile.local == Path("/"):
         raise UsageError("refusing to sync the whole file system")
     rc = find_rclone(args.rclone)
-    rc.flags = general_flags(user_flags)                     # e.g. --config, --timeout
+    check_flags = general_flags(user_flags)                  # for `rclone check` (keeps filters)
+    rc.flags = strip_filter_flags(check_flags)               # for housekeeping calls (no filters)
     ensure_config_password(rc)
     check_remote_configured(rc, profile.remote)
-    warn_plain_http(rc, profile.remote)
-    feat = remote_features(rc, profile.remote)
+    chain = remote_chain(rc, profile.remote)
+    warn_plain_http(rc, profile.remote, chain)
+    feat = remote_features(rc, profile.remote, chain)
+    verify_download_explicit = profile.verify_download is not None
     resolve_remote_options(profile, feat)
     if not feat.mtime:
         for mode in (profile.conflict_resolve, profile.resync_mode):
@@ -1317,10 +1423,13 @@ def run(args: argparse.Namespace, extra: list[str]) -> int:
     rc.pass_fds = (lock.fd,)
     try:
         clear_stale_bisync_locks(st)
+        for orphan in st.logs.glob("*.jsonl"):               # left behind by hard-killed runs
+            orphan.unlink(missing_ok=True)
         filters_text = render_filters(profile, st)
         write_if_changed(st.filters, filters_text)
         if args.verify:
-            return verify(rc, profile, st, args.yes, max_show)
+            return verify(rc, profile, st, args.yes, max_show, check_flags,
+                          verify_download_explicit)
         return sync(rc, profile, st, args, extra, filters_text, max_show)
     finally:
         lock.release()
@@ -1330,13 +1439,13 @@ def review(plan: Report, profile: Profile, resync: bool, stamp: str) -> int | No
     """Ask for confirmation of a previewed plan; None means: go ahead."""
     unclear = plan.n_actions == 0 and (
         plan.stats_transfers > 0 or (not resync and not (
-            plan.no_changes or plan.bisync_changes == 0 and not plan.plan_lines)))
+            plan.no_changes or (plan.bisync_changes == 0 and not plan.plan_lines))))
     if unclear:
         # bisync plans something this wrapper could not classify (e.g. a changed
         # log format in a newer rclone): never present that as "nothing to do".
         warn("could not fully interpret bisync's plan; its own summary:")
         for line in plan.plan_lines:
-            info(f"  {line}")
+            info(f"  {safe_display(line)}")
         if plan.stats:
             info(plan.stats)
         prompt = "Apply bisync's plan as shown above?"
@@ -1377,7 +1486,8 @@ def report_surprises(plan: Report, done: Report, max_show: int | None) -> None:
     for title, paths in found:
         limit = len(paths) if max_show is None else max_show
         more = f" ... and {len(paths) - limit} more" if len(paths) > limit else ""
-        lines.append(f"    {title}: {', '.join(paths[:limit])}{more}")
+        shown = ", ".join(safe_display(p) for p in paths[:limit])
+        lines.append(f"    {title}: {shown}{more}")
     print("\n".join(lines), file=sys.stderr, flush=True)
 
 
@@ -1462,7 +1572,8 @@ def sync(rc: Rclone, profile: Profile, st: State, args: argparse.Namespace,
         if args.dry_run:
             info("--dry-run: nothing was changed.")
             return EXIT_OK
-        if resync and plan.n_actions == 0 and not local_has_files(rc, profile, st):
+        if resync and plan.n_actions == 0 and plan.stats_transfers == 0 \
+                and not local_has_files(rc, profile, st):
             info(NOTHING_YET)       # (nothing planned + nothing local = server empty too)
             return EXIT_OK
         if (answer := review(plan, profile, resync, stamp)) is not None:

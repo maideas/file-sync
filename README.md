@@ -92,13 +92,14 @@ filters = ["- .git/**", "- *.tmp"]
 | `sync_empty_dirs` | `false` | also create and delete empty directories |
 | `conflict_resolve` | `none` | `none` keeps both copies; or `local`, `remote`, `larger`, `smaller`, ... |
 | `resync_mode` | `local` | which copy wins for differing files during `--resync` |
-| `ignore_times` | auto | force transfers of same-size files. Auto-detected: on for remotes that cannot store file modification times (webdav, ftp -- e.g. web.de); off otherwise |
-| `verify_download` | auto | `--verify` downloads every file. Auto-detected: on for remotes that offer no checksums (webdav, ftp); off otherwise |
-| `rclone_flags` | `[]` | extra rclone flags, e.g. `["--tpslimit", "4"]`: bisync-only flags reach only bisync, and filter flags (`--exclude`, `--min-size`, ...) are kept away from the backup housekeeping calls (pruning, listings, emptiness check) so those always work. Flags the wrapper controls itself are refused, see [Usage](#usage) |
+| `ignore_times` | auto | force transfers of same-size files. Auto-detected: on for remotes (including wrapped `crypt`/`alias` remotes) that cannot store file modification times (webdav, ftp -- e.g. web.de); off otherwise |
+| `verify_download` | auto | `--verify` downloads every file. Auto-detected: on for remotes that offer no checksums (webdav, ftp, crypt, or wrapped chains); off otherwise (also verified against rclone's backend features before trusting a checksum-only check) |
+| `rclone_flags` | `[]` | extra rclone flags, e.g. `["--tpslimit", "4"]`: bisync-only flags reach only bisync, and filter flags (`--exclude`, `--min-size`, ...) are kept away from housekeeping calls (pruning, listings, folder checks) so those always work. Flags the wrapper controls itself are refused, see [Usage](#usage) |
 
-The auto-detection reads the remote's backend type from `rclone config dump`
-(in memory only; nothing of it is printed or stored) and can be overridden per
-profile with `ignore_times` / `verify_download`.
+The auto-detection reads only the active remote's section (and any wrapped
+remotes) from `rclone config show` (in memory only; nothing of it is printed
+or stored) and can be overridden per profile with `ignore_times` /
+`verify_download`.
 
 Changing the filter rules (or `local`/`remote`) requires one resync. The
 script detects this and offers the resync on the next interactive run.
@@ -207,14 +208,14 @@ Exit codes:
 | Abort if one side is completely empty (unmounted disk, wrong path) | rclone bisync |
 | Replaced and deleted files are moved to `.file-sync-backup/<time>/` on their side | rclone bisync, enabled by the wrapper |
 | Resume after a crash or Ctrl-C without a resync (`--resilient --recover`) | rclone bisync, enabled by the wrapper |
-| Preview and confirmation; `--force` only with a reviewed preview, also not via `rclone_flags` or `--` | wrapper |
+| Preview and confirmation; `--force` only with a reviewed preview, also not via `rclone_flags`, `--`, or `RCLONE_*` environment variables | wrapper |
 | One run per profile (`flock`, inherited by rclone); stale bisync locks removed safely | wrapper |
 | First run and filter changes are never done silently by `-y` | wrapper |
 | Overwrites are counted exactly in the preview, also in a resync and with backups off | wrapper |
 | Changes that happened between preview and sync are reported after the run | wrapper |
-| Common credential parameters inside the REMOTE string are refused: parameter names containing `pass`, `token` or `secret`, and the name `key` (best effort, not a complete list). Plain `http://` remotes get a warning | wrapper |
+| Common credential parameters and URL-embedded passwords (`user:pass@host`) inside the REMOTE string are refused (best effort, not a complete list). Plain `http://` remotes (including wrapped remotes) get a warning | wrapper |
 | A vanished remote folder is an error, not a reason to delete local files | wrapper |
-| File names that imitate rclone's messages (`Failed to bisync.txt`) do not change the run's outcome | wrapper |
+| File names that imitate rclone's messages (`Failed to bisync.txt`) or contain terminal control sequences do not alter the run's outcome or spoof the preview | wrapper |
 | Same-size edits reach remotes without file times (`--ignore-times`, auto-detected) | wrapper |
 | State and logs in `~/.local/state/file-sync/` with mode `0700` | wrapper |
 
