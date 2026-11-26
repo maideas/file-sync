@@ -197,12 +197,27 @@ remote = "webde:/sync-test"
 max_delete        = 5            # abort if >5% of files would be deleted
 check_access      = true
 keep_backups_days = 30           # default `backups = true` already applies
+
+[fritz]                          # NAS / SMB share, e.g. a FRITZ!Box USB drive:
+                                 # `rclone config` -> type `smb`,
+                                 # host `fritz.box`, user/password of a NAS user;
+                                 # the share name goes into the path
+local  = "~/Documents"
+remote = "fritznas:USB-STICK/Documents"
+
+# smb serves real modification times (change detection works without
+# ignore_times) but no checksums: --verify auto-detects and downloads every
+# file once. Shares are case-insensitive: do not create `a.txt` and `A.txt`
+# side by side.
+check_access = true              # guard against the NAS being unreachable
+filters = ["- .git/**", "- *.tmp"]
 ```
 
 Two things to keep in mind when adapting these:
 
-- every remote (`webde`, `webde-crypt`, `nextcloud`, `gdrive`, `myserver`)
-  must first be created with `rclone config` and exists in `rclone listremotes`
+- every remote (`webde`, `webde-crypt`, `nextcloud`, `gdrive`, `myserver`,
+  `fritznas`) must first be created with `rclone config` and exists in
+  `rclone listremotes`
 - do not point two profiles at the same folder pair -- each gets its own
   bisync state, which breaks change detection (see [Files](#files))
 
