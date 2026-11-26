@@ -70,6 +70,22 @@ Any other rclone remote works the same way -- a `nextcloud:` (webdav,
 `vendor = nextcloud`), `gdrive:`, `s3:`, `sftp:` ... The examples below use a
 remote named `cloud:`.
 
+The remotes used by the [profile examples](#profile-examples) are created the
+same way; these are the answers that matter for each:
+
+| Remote | Storage | Answers that matter (`rclone config` prompts) |
+| --- | --- | --- |
+| `webde` | `webdav` | the table above |
+| `nextcloud` | `webdav` | url the full DAV endpoint, e.g. `https://<server>/remote.php/dav/`, vendor `nextcloud`, user your Nextcloud user name, pass an **app password** (personal settings → Security; current Nextcloud versions reject the account password for external clients) |
+| `gdrive` | `drive` | scope `drive` (full access -- the default), so rclone sees existing files; the OAuth prompt opens a browser -- on a headless machine authorize on another PC with `rclone authorize "drive"` |
+| `webde-crypt` | `crypt` | remote `webde:/encrypted`, filename encryption `standard`, encrypted directory names (both defaults), a password |
+| `myserver` | `sftp` | host, user, pass (or a `key_file`); the profile path `myserver:/srv/docs` is absolute on the server |
+| `fritznas` | `smb` | host `fritz.box`, user/pass of a FRITZ!Box user with NAS rights; the share name (`USB-STICK`) goes into the profile path, not the config |
+
+All of them can also be created non-interactively, e.g.
+`rclone config create nextcloud webdav url=https://example.com/remote.php/dav/ vendor=nextcloud user=me`
+(rclone then asks just for the password).
+
 **Remote path syntax:** On WebDAV, Google Drive, and Nextcloud, `cloud:Docs`
 and `cloud:/Docs` refer to the same folder, and `cloud:` is the remote root.
 On `sftp:`, `cloud:Docs` is relative to your remote home directory while
@@ -217,7 +233,8 @@ Two things to keep in mind when adapting these:
 
 - every remote (`webde`, `webde-crypt`, `nextcloud`, `gdrive`, `myserver`,
   `fritznas`) must first be created with `rclone config` and exists in
-  `rclone listremotes`
+  `rclone listremotes` (the answers for each are in
+  [step 2](#2-add-the-rclone-remote))
 - do not point two profiles at the same folder pair -- each gets its own
   bisync state, which breaks change detection (see [Files](#files))
 
